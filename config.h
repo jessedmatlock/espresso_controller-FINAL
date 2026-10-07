@@ -5,6 +5,16 @@
 // concurrency refactor — values unchanged from the original single-file version.
 #pragma once
 
+// Uncomment for bench testing WITHOUT hardware connected:
+// Skips ALL hardware init (relays, sensors, display, PID task, watchdog).
+// Only WiFi AP, web server, WebSocket, and serial remain active.
+// Use to confirm web UI and serial before installing MCU onto expansion board.
+// Comment out when installing onto hardware for sensor commissioning or production.
+// Defined here (not in the main .ino) so every .cpp file in the sketch that
+// includes config.h sees the same setting — relays.cpp's set_boiler_element()
+// in particular depends on this.
+//#define BENCH_MODE
+
 // --- Pin Configuration ---
 const int PIN_TEMP_CS = 21;       // SPI CS for MAX31865 RTD (D10/GPIO21)
 const int PIN_FILL_PROBE = 2;     // Fill level probe, analog (A1/GPIO2)
@@ -41,6 +51,7 @@ const unsigned long FILL_MAX_DURATION = 60000;  // ms, normal (post-boot) fill t
 const unsigned long STARTUP_FILL_TIMEOUT = 120000;  // ms, one-time never-filled-before boot timeout
 
 const unsigned long LOOP_TIMEOUT = 5000;  // ms, hardware watchdog timeout
+const unsigned long PID_JITTER_THRESHOLD = 105;  // ms, alert if PID cycle exceeds this
 
 // --- EEPROM Storage Structure ---
 const uint16_t EEPROM_SIGNATURE = 0xABCD;

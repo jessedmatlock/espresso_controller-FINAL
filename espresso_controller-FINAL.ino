@@ -105,15 +105,18 @@ Features:
  - Boiler temperature read via MAX31865 (PT100 3-wire RTD)
  - OLED Display (1.5" 128x128 SH1107 Driver, IIC 4 Pins) with partial updates
  - NAU7802 24-bit ADC Load Cell (I2C interface) for shot weight measurement
- - Requirements-compliant architecture: Core 1 hardware timer ISR + Core 0 millis() timing
- - Core 1: Hardware timer ISR for PID control (100ms deterministic)
- - Core 0: Main loop with millis() timing for all non-critical operations
+ - Explicit dual-core architecture: ControlTask (Core 1, FreeRTOS task, 100ms
+   vTaskDelayUntil-paced) for PID control; SystemTask (Core 0, FreeRTOS task,
+   explicitly pinned) for web UI, display, sensors, and state machine. Both
+   tasks are created explicitly in setup() — neither core is assumed.
  - Comprehensive state machine with error handling and safety margins
  - Real-time Web UI with Chart.js shot graphing
  - Complete EEPROM parameter storage including PID gains and fill probe threshold
  - Parameter validation ensuring pre-infusion/PID boost times ≤ shot target time
  - Hardware safety cutoff and watchdog systems
- - Fully non-blocking operation - zero delay() calls throughout system
+ - Non-blocking operation in the steady-state tasks; a handful of brief delay()
+   calls remain in one-time init and calibration paths (see sensors.cpp,
+   calibration code) — not in the control or display loop
  - Momentary brew button with rising edge detection and double-press protection
  - 3-wire pressure transducer (0.5-4.5V, 0-2MPa) with Web UI calibration and pump control
  - Comprehensive EEPROM parameter storage (72 bytes, addresses 0-71, no conflicts)
@@ -121,24 +124,18 @@ Features:
 NOTE: Fully requirements-compliant production firmware per specification document.
 */
 
-// Uncomment for bench testing WITHOUT hardware connected:
-// Skips ALL hardware init (relays, sensors, display, PID task, watchdog).
-// Only WiFi AP, web server, WebSocket, and serial remain active.
-// Use to confirm web UI and serial before installing MCU onto expansion board.
-// Comment out when installing onto hardware for sensor commissioning or production.
-
-//#define BENCH_MODE
+// BENCH_MODE is now defined in config.h — it must be visible to every .cpp
+// file in the sketch (e.g. relays.cpp's set_boiler_element()), not just this
+// one, so the macro itself lives there instead of here.
 
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WebServer.h>
 #include <WebSocketsServer.h>
-#include "bootstrap_custom.h"
-#include "bootstrap_js.h"
-#include "apexcharts_js.h"
-#include "web_ui_css.h"
-#include "web_ui_html.h"
-#include "web_ui_js.h"
+// The 6 web-asset PROGMEM headers (bootstrap_custom.h, bootstrap_js.h,
+// apexcharts_js.h, web_ui_css.h, web_ui_html.h, web_ui_js.h) are now included
+// only in web_api.cpp — see the comment at the top of that file for why
+// including them here too would duplicate ~700KB of data in flash.
 #include <Wire.h>
 #include <U8g2lib.h>
 #include <Adafruit_NAU7802.h>
@@ -149,6 +146,14 @@ NOTE: Fully requirements-compliant production firmware per specification documen
 #include "config.h"
 #include "error_system.h"
 #include "shared_state.h"
+#include "state_machine.h"
+#include "control_task.h"
+#include "relays.h"
+#include "sensors.h"
+#include "calibration.h"
+#include "eeprom_store.h"
+#include "display.h"
+#include "web_api.h"
 
 // Pin assignments, EEPROM map, and cross-cutting safety constants now live in
 // config.h. PID gains, setpoint, boost/pre-infusion flags, allowUnsafePid,
@@ -179,6 +184,10 @@ const char* password = "espresso";
 WebServer server(80);
 WebSocketsServer webSocket = WebSocketsServer(81);
 
+// Core 0 SystemTask handle — declared here (used by setup() below, defined
+// alongside systemTask() near loop() at the bottom of the file).
+static TaskHandle_t systemTaskHandle = NULL;
+
 // Web server rate limiting
 unsigned long lastWebRequest = 0;
 const unsigned long WEB_RATE_LIMIT = 50;  // 50ms between requests
@@ -190,17 +199,7 @@ const unsigned long WEBSOCKET_BROADCAST_INTERVAL = 100;  // 100ms WebSocket upda
 // EEPROM signature, size, and ADDR_* memory map now live in config.h.
 
 // --- State Machine ---
-enum SystemState {
-  STATE_BOOT,
-  STATE_IDLE,
-  STATE_BREW_START,
-  STATE_BREW_ACTIVE,
-  STATE_BREW_END,
-  STATE_FILL,
-  STATE_CLEANING,
-  STATE_ERROR
-};
-
+// SystemState enum now lives in state_machine.h (shared with control_task.cpp).
 volatile SystemState currentState = STATE_BOOT;
 volatile SystemState previousState = STATE_BOOT;
 
@@ -229,12 +228,11 @@ unsigned long preInfusionStartTime = 0;
 
 // currentTemp and cachedRawTemp now live in shared_state.cpp
 // (getTemp()/setTemp(), getCachedRawTemp()/setCachedRawTemp()).
-double pidOutput = 0.0;  // 0.0 - 1.0, Core 1 (PID task) internal scratch value
+// pidOutput is now a local variable inside control_task.cpp's pid_step().
 
 // Temperature rate-of-change protection (unified limit for sensor and PID)
-// MAX_TEMP_RATE now lives in config.h.
-double lastTemp = 77.0;
-unsigned long lastTempTime = 0;
+// MAX_TEMP_RATE now lives in config.h; lastTemp/lastTempTime are now private
+// to sensors.cpp's read_boiler_temp().
 
 // Display variables
 double shotTime = 0.0;
@@ -265,10 +263,8 @@ double currentShotRatio = 0.0;  // Current output÷dose ratio (e.g., 2.0 = 1:2 r
 // NAU7802 scale variables
 int32_t scaleZeroOffset = 0;  // Zero offset for tare functionality
 
-// Scale reading stability variables (moved from static in readScale() for clarity and testability)
-float lastValidScaleWeight = 0;
-int scaleStableReadings = 0;
-bool scaleStabilityReset = false;  // Flag to reset stability on brew start
+// Scale reading stability variables are now local statics inside
+// sensors.cpp's readScale() — nothing else referenced them.
 
 // Scale reliability tracking for weight-based brew stop
 // If scale becomes unreliable at ANY point during shot, brew stops by time instead of weight
@@ -289,11 +285,13 @@ bool pumpTimeoutTriggered = false;
 bool completionMessageActive = false;
 
 // --- Performance Monitoring Variables ---
-// PID timing validation (volatile: written by Core 1 checkPIDTiming, read by Core 0 logPerformanceMetrics)
-static volatile unsigned long lastPIDTime = 0;
-static volatile unsigned long maxPIDJitter = 0;
-static volatile unsigned long pidJitterCount = 0;
-const unsigned long PID_JITTER_THRESHOLD = 105;  // Alert if PID cycle > 105ms
+// PID timing validation (volatile: written by control_task.cpp's checkPIDTiming()
+// on Core 1, read by logPerformanceMetrics() on Core 0). NOT static — control_task.cpp
+// needs external linkage to these via `extern` to keep updating the same counters
+// it always has; PID_JITTER_THRESHOLD now lives in config.h for the same reason.
+volatile unsigned long lastPIDTime = 0;
+volatile unsigned long maxPIDJitter = 0;
+volatile unsigned long pidJitterCount = 0;
 
 // Memory monitoring
 static unsigned long lastMemoryCheck = 0;
@@ -301,16 +299,19 @@ static size_t minFreeHeap = SIZE_MAX;
 const size_t MEMORY_WARNING_THRESHOLD = 40000;     // Alert if free heap < 40KB
 const unsigned long MEMORY_CHECK_INTERVAL = 5000;  // Check every 5 seconds
 
-// Performance metrics
-static unsigned long webRequestCount = 0;
-static unsigned long webSocketMessageCount = 0;
-static unsigned long maxWebResponseTime = 0;
-static unsigned long totalWebResponseTime = 0;
+// Performance metrics — not static: written from web_api.cpp's
+// handleStatus()/broadcastWebSocketData(), read by logPerformanceMetrics()
+// here (same cross-TU reason as the PID jitter counters above).
+unsigned long webRequestCount = 0;
+unsigned long webSocketMessageCount = 0;
+unsigned long maxWebResponseTime = 0;
+unsigned long totalWebResponseTime = 0;
 
 // Load monitoring flags
-static volatile bool performanceMonitoringEnabled = true;  // Read by Core 1 (checkPIDTiming), written by Core 0 (serial cmds)
+// Not static — control_task.cpp reads/writes these via `extern` (see note above).
+volatile bool performanceMonitoringEnabled = true;  // Read by Core 1, written by Core 0 (serial cmds)
 static bool memoryWarningActive = false;
-static volatile bool pidTimingWarningActive = false;  // Written by Core 1, read by Core 0
+volatile bool pidTimingWarningActive = false;  // Written by Core 1, read by Core 0
 
 // PID task logging flags (set by PID task, processed by main loop)
 volatile bool pidLogTempRateError = false;
@@ -338,17 +339,8 @@ const int PUMP_FAILURE_COUNT = 3;                        // Consecutive failures
 // Scale data protection mutex
 portMUX_TYPE scaleMux = portMUX_INITIALIZER_UNLOCKED;
 
-// Calibration state machine (replaces String-based state tracking)
-enum CalStep : uint8_t {
-  CAL_IDLE,
-  CAL_FILL_DRY, CAL_FILL_WET,
-  CAL_SCALE_ZERO, CAL_SCALE_WEIGHT, CAL_SCALE_CONFIRM,
-  CAL_PRESSURE_ZERO, CAL_PRESSURE_HIGH
-};
-CalStep calStep = CAL_IDLE;
-inline bool isCalibrating() { return calStep != CAL_IDLE; }
-inline bool isPressureCal() { return calStep == CAL_PRESSURE_ZERO || calStep == CAL_PRESSURE_HIGH; }
-inline bool isFillScaleCal() { return calStep >= CAL_FILL_DRY && calStep <= CAL_SCALE_CONFIRM; }
+// CalStep enum, calStep global, and isCalibrating()/isPressureCal()/
+// isFillScaleCal() now live in calibration.h (shared broadly).
 int fillProbeDryReading = 0;
 int fillProbeWetReading = 0;
 int fillProbeThreshold = 512;  // Midpoint default
@@ -360,9 +352,24 @@ bool fillProbeWet = false;
 unsigned long lastFillCheck = 0;
 const unsigned long FILL_CHECK_INTERVAL = 1000;  // 1s fill probe check
 const unsigned long FILL_PULSE_DURATION = 2000;  // 2s fill pulse duration
-const unsigned long FILL_MAX_DURATION = 60000;   // 60 second maximum fill time
-unsigned long fillStartTime = 0;
+// FILL_MAX_DURATION/STARTUP_FILL_TIMEOUT now live in config.h.
+unsigned long fillStartTime = 0;  // Reset every 2s pulse cycle (pump on/off timing)
 bool fillInProgress = false;
+
+// Separate from fillStartTime on purpose: fillStartTime resets every 2s pulse
+// cycle, so a timeout check against it would never actually elapse during a
+// prolonged dry fill. fillAttemptStartTime marks when THIS fill attempt began
+// and is never reset until the attempt ends — this is what the safety timeout
+// below actually measures against.
+unsigned long fillAttemptStartTime = 0;
+unsigned long currentFillTimeoutMs = FILL_MAX_DURATION;
+
+// True once at boot if boilerFilled was already true in EEPROM (i.e. this
+// isn't a fresh install) — gives the very first fill attempt after boot the
+// longer STARTUP_FILL_TIMEOUT grace period, exactly like the old blocking
+// runStartupFillCycle() did, before being consumed (set false) by that first
+// startFillRoutine() call. All later fills use the normal FILL_MAX_DURATION.
+bool pendingStartupFillGrace = false;
 
 // Brew switch variables
 bool brewSwitchPressed = false;
@@ -374,7 +381,7 @@ unsigned long lastBrewButtonPress = 0;           // For double-press protection
 const unsigned long BREW_BUTTON_COOLDOWN = 200;  // 200ms between button presses
 
 // Pressure measurement variables
-const int PIN_PRESSURE = 1;    // Pressure transducer analog input (A0/GPIO1)
+// PIN_PRESSURE now lives in config.h.
 double currentPressure = 0.0;  // Current pressure in Bar
 double pressureOffset = 0.0;   // Zero pressure calibration offset
 double pressureScale = 1.0;    // Pressure scaling factor
@@ -386,22 +393,13 @@ double pressureHighValue = 8.0;  // User-configurable high pressure calibration 
 unsigned long lastPressureRead = 0;
 const unsigned long PRESSURE_READ_INTERVAL = 250;  // 250ms pressure reading
 
-// Pressure smoothing (exponential moving average)
-double filteredPressure = 0.0;
-const double pressureAlpha = 0.2;  // Smoothing factor (0.2 = light smoothing)
-bool pressureFirstReading = true;
+// Pressure smoothing (exponential moving average): filteredPressure,
+// pressureAlpha, and pressureFirstReading are now private to sensors.cpp's
+// readPressure() — nothing else referenced them.
 
-// Pressure transducer constants - Direct 3.3V connection
-const double ADC_MAX_VOLTAGE = 3.3;  // ESP32 ADC reference voltage
-const int ADC_RESOLUTION = 4096;     // 12-bit ADC resolution
-
-// PID internals (accessed by ISR - use volatile)
-volatile double pid_integral = 0.0;
-volatile double pid_prev_error = 0.0;
-// Core 1 PID Task variables
-TaskHandle_t pidTaskHandle = NULL;
-portMUX_TYPE pidMux = portMUX_INITIALIZER_UNLOCKED;
-volatile bool pidTaskRunning = false;
+// ADC_MAX_VOLTAGE/ADC_RESOLUTION now live in config.h.
+// pid_integral/pid_prev_error/pidMux/pidTaskHandle/pidTaskRunning now live
+// in control_task.cpp (private to the ControlTask).
 
 // EEPROM save re-entrancy guard is a static bool inside saveParametersToEEPROM()
 // Deferred EEPROM save — reduces flash wear by coalescing rapid parameter changes
@@ -424,10 +422,10 @@ const unsigned long DISPLAY_UPDATE_ERROR = 100;  // 100ms unified rate
 // Error handling and watchdog
 unsigned long lastLoopTime = 0;
 unsigned long lastWatchdogCheck = 0;
-const unsigned long LOOP_TIMEOUT = 5000;         // 5 seconds
+// LOOP_TIMEOUT now lives in config.h.
 const unsigned long LOOP_CHECK_INTERVAL = 1000;  // Check every second
 bool loopTimeoutTriggered = false;
-bool rtdFault = false;
+// rtdFault is now private to sensors.cpp (initRTDSensor()/read_boiler_temp()).
 
 // Initialization failure tracking
 bool displayFailed = false;
@@ -478,19 +476,10 @@ void changeState(SystemState newState);
 SystemState getState();
 const char* getStateName(SystemState state);
 
-// Relay control
-void set_pump(bool state);
-void set_brew_solenoid(bool state);
-void set_fill_solenoid(bool state);
-void set_boiler_element(bool state);
+// Relay control now declared in relays.h (bool-returning).
 
-// Calibration
-void saveParametersToEEPROM();
-bool loadParametersFromEEPROM();
-int readFillProbeRaw();
-void startPressureCalibration();
-void processPressureCalibrationStep();
-void completePressureCalibration();
+// Calibration now declared in calibration.h.
+// EEPROM persistence now declared in eeprom_store.h.
 
 // Routines
 void startBrewRoutine();
@@ -498,66 +487,38 @@ void stopBrewRoutine();
 void startFillRoutine();
 void stopCleaningCycle();
 
-// PID
-void pid_step();
+// PID control now declared in control_task.h (pid_step() is private to
+// control_task.cpp; only initPIDTask()/resetPidIntegral() are public).
 
-// Sensors
-double readPressure();
-void initPressure();
-double read_boiler_temp();
-void readScale();
-void calculateFlowRate();
-void calculateShotRatio();
-double getTemp();
-void setTemp(double temp);
-double getCachedRawTemp();
-void setCachedRawTemp(double temp);
+// Core 0 steady-state task (explicitly pinned in setup(); see its definition
+// near loop() for why Arduino's own loop() is now an inert stub).
+void systemTask(void* parameter);
+
+// Sensors now declared in sensors.h.
 uint8_t getErrorFlags();
 
 // Error system
 void setError(uint8_t flag);
 void clearError(uint8_t flag);
 
-// Hardware init
-void initRelays();
-void runStartupFillCycle();
-bool initRTDSensor();
-void initPIDTask();
+// Hardware init (initRelays() now declared in relays.h; runStartupFillCycle()
+// removed — see updateFillRoutine()/setup() for the non-blocking replacement)
 
-// Display
-void updateDisplay();
-
-// Calibration (additional)
-void startFillProbeCalibration();
-void startScaleCalibration();
-void completeScaleCalibration(float knownWeight);
-const char* calStepName(CalStep s);
-bool isFillScaleCal();
-bool isPressureCal();
+// Display now declared in display.h.
 
 // System operations
 void startCleaningCycle();
 void checkFillLevel();
 void updateFillRoutine();
 void checkBrewSwitch();
-bool readFillProbe();
 void checkSystemHealth();
 void checkWatchdog();
 void handleSystemErrors();
 void checkMemoryUsage();
 void logPerformanceMetrics();
 
-// Web handlers
-void handleRoot();
-void handleStatus();
-void broadcastWebSocketData();
-
-// WebSocket
-void sendWebSocketData(uint8_t num);
-int buildStatusJSON(char* buf, size_t len, bool includeSetup);
+// Web handlers, WebSocket, and buildStatusJSON() now declared in web_api.h.
 void processPIDTaskLogs();
-void handleSetSafety();
-void handleSetParams();
 
 // --- Timing Helper Functions ---
 bool millisElapsed(unsigned long startTime, unsigned long interval) {
@@ -579,679 +540,19 @@ bool isPidAllowed() {
   return setupComplete || getAllowUnsafePid();
 }
 
-// --- NAU7802 Scale Functions ---
-bool initScale() {
-  if (!nau.begin()) {
-    scaleInitialized = false;
-    scaleConnected = false;
-    Serial.println("NAU7802 scale initialization failed");
-    return false;
-  }
-
-  // Configure NAU7802
-  nau.setLDO(NAU7802_3V3);                 // 3.3V load cell excitation
-  nau.setGain(NAU7802_GAIN_128);           // Maximum sensitivity
-  nau.setRate(NAU7802_RATE_80SPS);         // 80 samples per second
-  nau.calibrate(NAU7802_CALMOD_INTERNAL);  // Internal ADC offset calibration
-
-  scaleInitialized = true;
-  scaleConnected = true;
-  Serial.println("NAU7802 scale initialized (3V3, GAIN_128, 80SPS)");
-  return true;
-}
-
-void readScale() {
-  if (!scaleInitialized) {
-    scaleConnected = false;
-    // If scale fails during brew, mark as unreliable - will stop by time instead
-    if (brewActive && scaleReliableEntireShot) {
-      scaleReliableEntireShot = false;
-      Serial.println("Scale became unreliable during brew - switching to time-based stop");
-    }
-    setError(ERR_FLAG_SCALE);
-    return;
-  }
-
-  if (nau.available()) {
-    int32_t rawReading = nau.read();
-    float reading = (rawReading - scaleZeroOffset) / scaleCalibrationFactor;
-    if (reading >= -1000 && reading <= 1000) {  // Sanity check
-
-      // Scale reading stability validation - optimized for brew progression
-      // Note: Variables moved to global scope for clarity and testability
-      const int requiredStableReadings = 2;     // Reduced from 3 to 2 for responsiveness
-      const float maxWeightDrift = 1.0;         // Increased from 0.2g to 1.0g for brew progression
-
-      // Reset stability variables when brew starts
-      if (brewActive && !scaleStabilityReset) {
-        lastValidScaleWeight = 0;
-        scaleStableReadings = 0;
-        scaleStabilityReset = true;
-      } else if (!brewActive) {
-        scaleStabilityReset = false;
-      }
-
-      // During brew, allow weight increases (normal progression)
-      if (brewActive && reading > lastValidScaleWeight) {
-        portENTER_CRITICAL(&scaleMux);
-        shotWeight = reading;  // Accept increasing weight during brew
-        portEXIT_CRITICAL(&scaleMux);
-        lastValidScaleWeight = reading;
-        scaleStableReadings = 0;  // Reset stability counter
-        scaleConnected = true;
-        clearError(ERR_FLAG_SCALE);
-      } else if (abs(reading - lastValidScaleWeight) < maxWeightDrift) {
-        // Stability check for non-brew or decreasing weight
-        scaleStableReadings++;
-        if (scaleStableReadings >= requiredStableReadings) {
-          portENTER_CRITICAL(&scaleMux);
-          shotWeight = reading;  // Accept stable reading
-          portEXIT_CRITICAL(&scaleMux);
-          scaleConnected = true;
-          clearError(ERR_FLAG_SCALE);
-        }
-      } else {
-        scaleStableReadings = 0;
-        lastValidScaleWeight = reading;
-        // Keep previous shotWeight until stable reading achieved
-        scaleConnected = true;  // Scale is responding, just not stable
-      }
-    } else {
-      scaleConnected = false;
-      // If scale gives bad readings during brew, mark as unreliable
-      if (brewActive && scaleReliableEntireShot) {
-        scaleReliableEntireShot = false;
-        Serial.println("Scale readings unreliable during brew - switching to time-based stop");
-      }
-      setError(ERR_FLAG_SCALE);
-    }
-  } else {
-    scaleConnected = false;
-    // If scale becomes unavailable during brew, mark as unreliable
-    if (brewActive && scaleReliableEntireShot) {
-      scaleReliableEntireShot = false;
-      Serial.println("Scale disconnected during brew - switching to time-based stop");
-    }
-    setError(ERR_FLAG_SCALE);
-  }
-}
-
-void tareScale() {
-  if (scaleInitialized && nau.available()) {
-    scaleZeroOffset = nau.read();
-    portENTER_CRITICAL(&scaleMux);
-    shotWeight = 0.0;
-    portEXIT_CRITICAL(&scaleMux);
-    Serial.println("Scale tared");
-  }
-}
-
-void calculateFlowRate() {
-  // Calculate flow rate during brewing only
-  if (!brewActive || !scaleConnected) {
-    currentFlowRate = 0.0;
-    return;
-  }
-
-  // Update flow rate at regular intervals
-  if (millisElapsed(lastFlowCalculation, FLOW_CALCULATION_INTERVAL)) {
-    double weightDelta = shotWeight - lastWeightForFlow;
-    double timeDelta = (millis() - lastFlowCalculation) / 1000.0;  // Convert to seconds
-
-    if (timeDelta > 0 && weightDelta > 0) {
-      // Convert weight delta (grams) to volume (ml) assuming espresso density ≈ 1g/ml
-      // Calculate flow rate in ml/s
-      currentFlowRate = weightDelta / timeDelta;
-
-      // Apply smoothing to reduce noise (exponential moving average)
-      const double flowAlpha = 0.3;  // Smoothing factor
-
-      if (flowRateFirstCalculation) {
-        smoothedFlowRate = currentFlowRate;
-        flowRateFirstCalculation = false;
-      } else {
-        smoothedFlowRate = flowAlpha * currentFlowRate + (1.0 - flowAlpha) * smoothedFlowRate;
-      }
-
-      currentFlowRate = smoothedFlowRate;
-    }
-
-    // Update tracking variables
-    lastWeightForFlow = shotWeight;
-    lastFlowCalculation = millis();
-  }
-}
-
-void calculateShotRatio() {
-  // Calculate shot ratio (output÷dose) during brewing
-  if (brewActive && scaleConnected && doseWeight > 0) {
-    currentShotRatio = shotWeight / doseWeight;
-  } else if (!brewActive) {
-    // Preserve final ratio after brew ends, reset only on new brew
-    // currentShotRatio remains at final value for display
-  } else {
-    currentShotRatio = 0.0;  // No scale or invalid dose weight
-  }
-}
-
-void calibrateScale(float knownWeight) {
-  if (scaleInitialized && nau.available()) {
-    portENTER_CRITICAL(&scaleMux);
-    int32_t reading = nau.read();  // Single reading to avoid blocking - mutex protected
-    portEXIT_CRITICAL(&scaleMux);
-
-    if (reading != 0) {
-      scaleCalibrationFactor = reading / knownWeight;
-      Serial.printf("Scale calibrated with factor: %.2f\n", scaleCalibrationFactor);
-    }
-  }
-}
-
-// --- Calibration Functions ---
-void startFillProbeCalibration() {
-  if (currentState != STATE_IDLE) {
-    Serial.println("Cannot calibrate - system not in IDLE state");
-    return;
-  }
-
-  calStep = CAL_FILL_DRY;
-  Serial.println("Fill probe calibration started - ensure probe is DRY");
-}
-
-void startScaleCalibration() {
-  if (currentState != STATE_IDLE) {
-    Serial.println("Cannot calibrate - system not in IDLE state");
-    return;
-  }
-
-  scaleCalComplete = false;
-  recomputeSetupComplete();
-  eepromDirty = true;
-  calStep = CAL_SCALE_ZERO;
-  Serial.println("Scale calibration started - remove all weight from scale");
-}
-
-void processCalibrationStep() {
-  if (!isFillScaleCal()) return;
-
-  switch (calStep) {
-    case CAL_FILL_DRY:
-      fillProbeDryReading = readFillProbeRaw();
-      Serial.printf("Fill probe DRY reading: %d\n", fillProbeDryReading);
-      calStep = CAL_FILL_WET;
-      Serial.println("Now ensure probe is WET (immerse in water)");
-      break;
-
-    case CAL_FILL_WET:
-      fillProbeWetReading = readFillProbeRaw();
-      Serial.printf("Fill probe WET reading: %d\n", fillProbeWetReading);
-      fillProbeThreshold = (fillProbeDryReading + fillProbeWetReading) / 2;
-      Serial.printf("Fill probe threshold set to: %d\n", fillProbeThreshold);
-      fillCalComplete = true;
-      calStep = CAL_IDLE;
-      eepromDirty = true;
-      Serial.println("Fill probe calibration completed and saved to EEPROM");
-      break;
-
-    case CAL_SCALE_ZERO:
-      if (scaleInitialized && nau.available()) {
-        portENTER_CRITICAL(&scaleMux);
-        scaleZeroReading = nau.read();
-        portEXIT_CRITICAL(&scaleMux);
-        Serial.printf("Scale ZERO reading: %.2f\n", (float)scaleZeroReading);
-        calStep = CAL_SCALE_WEIGHT;
-        Serial.println("Now place known weight (100g or 200g) on scale");
-      }
-      break;
-
-    case CAL_SCALE_WEIGHT:
-      if (scaleInitialized && nau.available()) {
-        portENTER_CRITICAL(&scaleMux);
-        scaleKnownWeightReading = nau.read();
-        portEXIT_CRITICAL(&scaleMux);
-        Serial.printf("Scale WEIGHT reading: %.2f\n", (float)scaleKnownWeightReading);
-        calStep = CAL_SCALE_CONFIRM;
-        Serial.println("Enter known weight value to complete calibration");
-      }
-      break;
-
-    default: break;
-  }
-}
-
-void completeScaleCalibration(float knownWeight) {
-  if (calStep == CAL_SCALE_CONFIRM) {
-    float rawRange = scaleKnownWeightReading - scaleZeroReading;
-    if (rawRange != 0 && knownWeight > 0) {
-      scaleCalibrationFactor = rawRange / knownWeight;
-      scaleZeroOffset = scaleZeroReading;  // Set zero offset for tare functionality
-
-      Serial.printf("Scale calibration completed:\n");
-      Serial.printf("  Zero reading: %.2f\n", (float)scaleZeroReading);
-      Serial.printf("  Weight reading: %.2f\n", (float)scaleKnownWeightReading);
-      Serial.printf("  Known weight: %.1fg\n", knownWeight);
-      Serial.printf("  Calibration factor: %.4f\n", scaleCalibrationFactor);
-      Serial.printf("  Zero offset: %ld\n", scaleZeroOffset);
-
-      // Mark scale calibration as complete (optional, non-blocking to PID)
-      scaleCalComplete = true;
-      recomputeSetupComplete();
-
-      calStep = CAL_IDLE;
-
-      eepromDirty = true;
-    } else {
-      Serial.println("Invalid calibration values");
-    }
-  }
-}
-
-// --- OLED Display Functions ---
-void initDisplay() {
-  if (!u8g2.begin()) {
-    displayFailed = true;
-    setError(ERR_FLAG_DISPLAY);
-    Serial.println("ERROR: OLED initialization failed - continuing with web UI only");
-    return;
-  }
-
-  u8g2.clearBuffer();
-  u8g2.setFont(u8g2_font_6x10_tf);
-  u8g2.drawStr(10, 20, "ESP32 Espresso");
-  u8g2.drawStr(10, 35, "Controller");
-  u8g2.drawStr(10, 50, "Initializing...");
-  u8g2.sendBuffer();
-  // Non-blocking initialization - splash screen will be shown until first update
-  Serial.println("Display initialized successfully");
-}
-
-// Previous display values for partial update optimization
-static double lastDisplayedShotTime = -1;
-static double lastDisplayedShotWeight = -1;
-static double lastDisplayedTemp = -1;
-static bool lastDisplayedBoilerHeating = false;
-static bool lastDisplayedBrewActive = false;
-static bool lastDisplayedFillActive = false;
-static bool lastDisplayedPreInfusionActive = false;
-static double lastDisplayedPressure = -1;
-static String lastDisplayedError = "";
-
-// Memory pool for string operations to prevent heap fragmentation
-static char tempStrBuffer[12];       // Temperature strings (e.g., "200.0F")
-static char weightStrBuffer[10];     // Weight strings (e.g., "36.0g")
-static char timeStrBuffer[10];       // Time strings (e.g., "30.0s")
-static char pressureStrBuffer[10];   // Pressure strings (e.g., "8.2BAR")
-static char flowRateStrBuffer[12];   // Flow rate strings (e.g., "2.1ml/s")
-static char shotRatioStrBuffer[10];  // Shot ratio strings (e.g., "2.0:1")
-static char displayBuffer[64];       // General display buffer
-
-// Pre-allocated JSON buffers for WebSocket and HTTP responses
-static char jsonStatusBuffer[768];    // Pre-allocated status JSON buffer (increased for full payload)
-static char webSocketBuffer[768];     // Pre-allocated WebSocket buffer (increased to prevent truncation)
-static char httpResponseBuffer[256];  // Pre-allocated HTTP response buffer
-
-void updateDisplay() {
-  // Skip OLED operations if display initialization failed
-  if (displayFailed) {
-    return;
-  }
-
-  // Track first-run display state (outside block so it can be reset)
-  static bool firstRunDisplayed = false;
-
-  // First-run setup display - show setup required message
-  if (!setupComplete) {
-    if (!firstRunDisplayed) {
-      u8g2.clearBuffer();
-      u8g2.setFont(u8g2_font_6x10_tf);
-
-      // Line 1: SETUP REQ.
-      u8g2.drawStr(30, 20, "SETUP REQ.");
-
-      // Line 2: AP name
-      u8g2.drawStr(30, 35, "espresso_AP");
-
-      // Line 3: IP address
-      u8g2.drawStr(30, 50, "192.168.4.1");
-
-      // Line 4: PID status
-      u8g2.drawStr(38, 65, "PID: OFF");
-
-      u8g2.sendBuffer();
-      firstRunDisplayed = true;
-    }
-    return;  // Don't show normal display during first-run setup
-  } else {
-    // Reset flag when setup completes so first-run screen can redraw if needed later
-    firstRunDisplayed = false;
-  }
-
-  // Partial OLED updates to reduce flicker (per requirements)
-  bool needsUpdate = false;
-
-  u8g2.setFont(u8g2_font_6x10_tf);
-
-  // Only update shot timer if changed
-  if (shotTime != lastDisplayedShotTime) {
-    u8g2.setDrawColor(0);  // Clear area
-    u8g2.drawBox(35, 8, 50, 10);
-    u8g2.setDrawColor(1);  // Draw text
-    u8g2.drawStr(5, 15, "Shot:");
-    // Use memory pool buffer to prevent fragmentation with bounds checking
-    snprintf(timeStrBuffer, sizeof(timeStrBuffer), "%.1fs", shotTime);
-    u8g2.drawStr(35, 15, timeStrBuffer);
-    lastDisplayedShotTime = shotTime;
-    needsUpdate = true;
-  }
-
-  // Only update weight if changed
-  if (shotWeight != lastDisplayedShotWeight || scaleConnected != (lastDisplayedShotWeight != -1)) {
-    u8g2.setDrawColor(0);  // Clear area
-    u8g2.drawBox(50, 23, 50, 10);
-    u8g2.setDrawColor(1);  // Draw text
-    u8g2.drawStr(5, 30, "Weight:");
-    // Use memory pool buffer to prevent fragmentation with bounds checking
-    if (scaleConnected) {
-      snprintf(weightStrBuffer, sizeof(weightStrBuffer), "%.1fg", shotWeight);
-    } else {
-      strlcpy(weightStrBuffer, "--.-g", sizeof(weightStrBuffer));
-    }
-    u8g2.drawStr(50, 30, weightStrBuffer);
-    lastDisplayedShotWeight = shotWeight;
-    needsUpdate = true;
-  }
-
-  // Only update temperature if changed significantly (>0.5°F)
-  double displayTemp = getTemp();
-  if (abs(displayTemp - lastDisplayedTemp) > 0.5) {
-    u8g2.setDrawColor(0);  // Clear area
-    u8g2.drawBox(35, 38, 50, 10);
-    u8g2.setDrawColor(1);  // Draw text
-    u8g2.drawStr(5, 45, "Temp:");
-    // Use memory pool buffer to prevent fragmentation with bounds checking
-    snprintf(tempStrBuffer, sizeof(tempStrBuffer), "%.1fF", displayTemp);
-    u8g2.drawStr(35, 45, tempStrBuffer);
-    lastDisplayedTemp = displayTemp;
-    needsUpdate = true;
-  }
-
-  // Only update boiler heating icon if changed
-  bool boilerHeatingNow = getBoilerHeatingState();
-  if (boilerHeatingNow != lastDisplayedBoilerHeating) {
-    u8g2.setDrawColor(0);  // Clear area
-    u8g2.drawBox(90, 38, 35, 10);
-    u8g2.setDrawColor(1);  // Draw text
-    if (boilerHeatingNow) {
-      u8g2.drawStr(90, 45, "HEAT");
-    }
-    lastDisplayedBoilerHeating = boilerHeatingNow;
-    needsUpdate = true;
-  }
-
-  // Only update status icons if changed
-  static bool lastDisplayedPidBoostActive = false;
-  bool preInfusionActiveNow = getPreInfusionActive();
-  bool pidBoostActiveNow = getPidBoostActive();
-  if (brewActive != lastDisplayedBrewActive || fillActive != lastDisplayedFillActive ||
-      preInfusionActiveNow != lastDisplayedPreInfusionActive || pidBoostActiveNow != lastDisplayedPidBoostActive) {
-    u8g2.setDrawColor(0);  // Clear status line
-    u8g2.drawBox(5, 53, 120, 10);
-    u8g2.setDrawColor(1);  // Draw icons
-    if (brewActive) {
-      u8g2.drawStr(5, 60, "BREW");
-    }
-    if (fillActive) {
-      u8g2.drawStr(35, 60, "FILL");
-    }
-    if (preInfusionActiveNow) {
-      u8g2.drawStr(60, 60, "PRE");
-    }
-    if (pidBoostActiveNow) {
-      u8g2.drawStr(90, 60, "BOOST");
-    }
-    lastDisplayedBrewActive = brewActive;
-    lastDisplayedFillActive = fillActive;
-    lastDisplayedPreInfusionActive = preInfusionActiveNow;
-    lastDisplayedPidBoostActive = pidBoostActiveNow;
-    needsUpdate = true;
-  }
-
-  // Display shot ratio during and after brewing
-  static double lastDisplayedShotRatio = -1;
-  if ((brewActive || currentShotRatio > 0) && scaleConnected && abs(currentShotRatio - lastDisplayedShotRatio) > 0.05) {
-    u8g2.setDrawColor(0);  // Clear ratio area
-    u8g2.drawBox(85, 53, 40, 10);
-    u8g2.setDrawColor(1);  // Draw ratio
-    if (currentShotRatio > 0) {
-      snprintf(shotRatioStrBuffer, sizeof(shotRatioStrBuffer), "%.1f:1", currentShotRatio);
-    } else {
-      strlcpy(shotRatioStrBuffer, "--:1", sizeof(shotRatioStrBuffer));
-    }
-    u8g2.drawStr(85, 60, shotRatioStrBuffer);
-    lastDisplayedShotRatio = currentShotRatio;
-    needsUpdate = true;
-  } else if (!brewActive && currentShotRatio == 0 && lastDisplayedShotRatio != -1) {
-    // Clear ratio when reset
-    u8g2.setDrawColor(0);
-    u8g2.drawBox(85, 53, 40, 10);
-    lastDisplayedShotRatio = -1;
-    needsUpdate = true;
-  }
-
-  // Only update pressure if changed significantly (>0.1 BAR)
-  if (abs(currentPressure - lastDisplayedPressure) > 0.1) {
-    u8g2.setDrawColor(0);  // Clear pressure area
-    u8g2.drawBox(5, 98, 60, 10);
-    u8g2.setDrawColor(1);  // Draw pressure
-    if (currentPressure >= 0) {
-      snprintf(pressureStrBuffer, sizeof(pressureStrBuffer), "%.1fBAR", currentPressure);
-    } else {
-      strlcpy(pressureStrBuffer, "--BAR", sizeof(pressureStrBuffer));
-    }
-    u8g2.drawStr(5, 105, pressureStrBuffer);
-    lastDisplayedPressure = currentPressure;
-    needsUpdate = true;
-  }
-
-  // Display flow rate during brewing
-  static double lastDisplayedFlowRate = -1;
-  if (brewActive && scaleConnected && abs(currentFlowRate - lastDisplayedFlowRate) > 0.1) {
-    u8g2.setDrawColor(0);  // Clear flow rate area
-    u8g2.drawBox(70, 98, 55, 10);
-    u8g2.setDrawColor(1);  // Draw flow rate
-    if (currentFlowRate > 0) {
-      snprintf(flowRateStrBuffer, sizeof(flowRateStrBuffer), "%.1fml/s", currentFlowRate);
-    } else {
-      strlcpy(flowRateStrBuffer, "--ml/s", sizeof(flowRateStrBuffer));
-    }
-    u8g2.drawStr(70, 105, flowRateStrBuffer);
-    lastDisplayedFlowRate = currentFlowRate;
-    needsUpdate = true;
-  } else if (!brewActive && lastDisplayedFlowRate != -1) {
-    // Clear flow rate when not brewing
-    u8g2.setDrawColor(0);
-    u8g2.drawBox(70, 98, 55, 10);
-    lastDisplayedFlowRate = -1;
-    needsUpdate = true;
-  }
-
-  // System message display (bottom line for errors)
-  static String lastDisplayedSystemMessage = "";
-  if (systemMessage != lastDisplayedSystemMessage) {
-    u8g2.setDrawColor(0);  // Clear system message area
-    u8g2.drawBox(5, 108, 120, 10);
-    u8g2.setDrawColor(1);  // Draw system message
-    if (systemMessage.length() > 0) {
-      u8g2.drawStr(5, 115, systemMessage.c_str());
-    }
-    lastDisplayedSystemMessage = systemMessage;
-    needsUpdate = true;
-  }
-
-  // Only update error messages if changed
-  if (systemMessage != lastDisplayedError) {
-    u8g2.setDrawColor(0);  // Clear error area
-    u8g2.drawBox(5, 68, 120, 25);
-    u8g2.setDrawColor(1);  // Draw error
-    if (systemMessage.length() > 0) {
-      u8g2.drawStr(5, 75, "ERROR:");
-      u8g2.drawStr(5, 90, systemMessage.c_str());
-    }
-    lastDisplayedError = systemMessage;
-    needsUpdate = true;
-  }
-
-  // Only send buffer if something actually changed
-  if (needsUpdate) {
-    u8g2.sendBuffer();
-  }
-}
-
-// --- Temperature Conversion Functions ---
-double celsiusToFahrenheit(double celsius) {
-  return (celsius * 9.0 / 5.0) + 32.0;
-}
-
-double fahrenheitToCelsius(double fahrenheit) {
-  return (fahrenheit - 32.0) * 5.0 / 9.0;
-}
-
-// --- MAX31865 PT100 RTD Temperature Reading ---
-bool initRTDSensor() {
-  if (!rtdSensor.begin(MAX31865_3WIRE)) {
-    Serial.println("MAX31865 RTD sensor initialization failed");
-    rtdFault = true;
-    setError(ERR_FLAG_RTD);
-    return false;
-  }
-
-  Serial.println("MAX31865 RTD sensor initialized (3-wire PT100)");
-  rtdFault = false;
-
-  // Auto-confirm temperature probe on successful initialization
-  // PT100 is a precision sensor - if hardware detects no faults and reading is valid,
-  // the probe is working correctly. Small offsets don't affect safety (25°F margin to cutoff).
-  // Take initial reading to validate probe
-  delay(50);  // Brief delay for first reading stability
-  float initialTemp = rtdSensor.temperature(RNOMINAL, RREF);
-  float initialTempF = (initialTemp * 9.0 / 5.0) + 32.0;
-
-  // Check for faults and validate reading is in reasonable range (32-250°F)
-  uint8_t fault = rtdSensor.readFault();
-  if (fault == 0 && initialTempF > 32.0 && initialTempF < 250.0) {
-    tempCalComplete = true;
-    recomputeSetupComplete();
-    Serial.printf("Temperature probe auto-confirmed: %.1f°F\n", initialTempF);
-    if (setupComplete) {
-      Serial.println("All required calibrations complete - PID enabled");
-    }
-  } else {
-    if (fault != 0) {
-      Serial.printf("Temperature probe fault detected: 0x%02X - manual verification required\n", fault);
-      rtdSensor.clearFault();
-    } else {
-      Serial.printf("Temperature reading out of range: %.1f°F - manual verification required\n", initialTempF);
-    }
-  }
-
-  return true;
-}
-
-double read_boiler_temp() {
-  static unsigned long lastRead = 0;
-  static double lastValidTemp = 77.0;  // Start at room temperature
-
-  unsigned long now = millis();
-  if (now - lastRead < 250) {  // Read every 250ms to avoid overwhelming the sensor
-    return getTemp();
-  }
-
-  lastRead = now;
-
-  // Read RTD resistance
-  uint16_t rtdValue = rtdSensor.readRTD();
-
-  // Check for RTD faults
-  uint8_t fault = rtdSensor.readFault();
-  if (fault) {
-    Serial.printf("RTD Fault detected: 0x%02X\n", fault);
-
-    if (fault & MAX31865_FAULT_HIGHTHRESH) {
-      Serial.println("RTD High Threshold Fault");
-    }
-    if (fault & MAX31865_FAULT_LOWTHRESH) {
-      Serial.println("RTD Low Threshold Fault");
-    }
-    if (fault & MAX31865_FAULT_REFINLOW) {
-      Serial.println("RTD REFIN- > 0.85 x Bias");
-    }
-    if (fault & MAX31865_FAULT_REFINHIGH) {
-      Serial.println("RTD REFIN- < 0.85 x Bias - FORCE- open");
-    }
-    if (fault & MAX31865_FAULT_RTDINLOW) {
-      Serial.println("RTD RTDIN- < 0.85 x Bias - FORCE- open");
-    }
-    if (fault & MAX31865_FAULT_OVUV) {
-      Serial.println("RTD Under/Over voltage fault");
-    }
-
-    rtdSensor.clearFault();  // Clear the fault register
-    rtdFault = true;
-    setError(ERR_FLAG_RTD);
-
-    // Return last known good temperature
-    setTemp(lastValidTemp);
-    return lastValidTemp;
-  }
-
-  // Calculate temperature from resistance
-  float resistance = rtdValue;
-  resistance /= 32768;
-  resistance *= RREF;
-
-  // Convert resistance to temperature (Celsius) using PT100 formula
-  double tempCelsius = rtdSensor.temperature(RNOMINAL, RREF);
-
-  // Validate temperature reading
-  if (tempCelsius < -50.0 || tempCelsius > 200.0) {
-    Serial.printf("Invalid temperature reading: %.2f°C\n", tempCelsius);
-    rtdFault = true;
-    setError(ERR_FLAG_RTD);
-    setTemp(lastValidTemp);
-    return lastValidTemp;
-  }
-
-  // Convert to Fahrenheit
-  double tempFahrenheit = celsiusToFahrenheit(tempCelsius);
-
-  // Clear RTD fault if reading is valid
-  if (rtdFault && hasErrorFlag(ERR_FLAG_RTD)) {
-    rtdFault = false;
-    clearError(ERR_FLAG_RTD);
-    Serial.printf("RTD fault cleared. Temperature: %.1f°F\n", tempFahrenheit);
-  }
-
-  // Temperature rate-of-change safety check (reuses 'now' from line 1240)
-  if (lastTempTime > 0) {
-    double timeDiff = (now - lastTempTime) / 1000.0;  // seconds
-    if (timeDiff > 0) {
-      double tempRate = abs(tempFahrenheit - lastTemp) / timeDiff;
-      if (tempRate > MAX_TEMP_RATE) {
-        Serial.printf("TEMPERATURE RATE ERROR: %.1f°F/s (max: %.1f°F/s)\n", tempRate, MAX_TEMP_RATE);
-        setError(ERR_FLAG_TEMP);
-        return lastValidTemp;  // Return last known good temperature
-      }
-    }
-  }
-  lastTemp = tempFahrenheit;
-  lastTempTime = now;
-
-  // Update current temperature
-  lastValidTemp = tempFahrenheit;
-  setTemp(tempFahrenheit);
-
-  return tempFahrenheit;
-}
+// initScale()/readScale()/tareScale()/calculateFlowRate()/calculateShotRatio()
+// now live in sensors.cpp. calibrateScale(float) was removed (zero callers).
+
+// startFillProbeCalibration()/startScaleCalibration()/processCalibrationStep()/
+// completeScaleCalibration() now live in calibration.cpp.
+
+// initDisplay()/updateDisplay() now live in display.cpp.
+// jsonStatusBuffer/webSocketBuffer now live in web_api.cpp. The unused
+// httpResponseBuffer and displayBuffer (zero references — dead code, same
+// class of issue as the removed set_ssr()/calibrateScale()) were removed.
+
+// celsiusToFahrenheit()/fahrenheitToCelsius()/initRTDSensor()/
+// read_boiler_temp() now live in sensors.cpp.
 
 // --- Error Management Functions ---
 void emergencyStop() {
@@ -1482,167 +783,17 @@ void handleSystemErrors() {
   }
 }
 
-// --- 4-Channel Relay Control Functions ---
-void initRelays() {
-  pinMode(PIN_RELAY_CH1, OUTPUT);
-  digitalWrite(PIN_RELAY_CH1, LOW);  // Brew Solenoid OFF
-  pinMode(PIN_RELAY_CH2, OUTPUT);
-  digitalWrite(PIN_RELAY_CH2, LOW);  // Pump OFF
-  pinMode(PIN_RELAY_CH3, OUTPUT);
-  digitalWrite(PIN_RELAY_CH3, LOW);  // Fill Solenoid OFF
-  pinMode(PIN_RELAY_CH4, OUTPUT);
-  digitalWrite(PIN_RELAY_CH4, LOW);  // Boiler Element SSR OFF
-  Serial.println("4-Channel relay system initialized");
-}
+// initRelays()/set_brew_solenoid()/set_pump()/set_fill_solenoid()/
+// set_boiler_element() now live in relays.cpp (bool-returning). The dead
+// set_ssr() "legacy" wrapper (zero callers) has been removed.
 
-void set_brew_solenoid(bool on) {
-  // Safety interlock: prevent brew solenoid activation during fill
-  if (on && fillActive) {
-    Serial.println("INTERLOCK: Brew solenoid blocked - fill active");
-    return;
-  }
-  digitalWrite(PIN_RELAY_CH1, on ? HIGH : LOW);
-}
+// readFillProbe()/readFillProbeRaw()/initFillSystem() now live in sensors.cpp.
 
-void set_pump(bool on) {
-  // Pressure safety lockout - prevent pump activation during over-pressure
-  if (on && pressureLockoutActive) {
-    Serial.printf("PRESSURE LOCKOUT: Pump activation blocked - pressure %.1f BAR (lockout until ≤%.1f BAR)\n", currentPressure, PRESSURE_LOCKOUT_LOW);
-    return;  // Pump stays OFF until pressure drops to 11.0 BAR or below
-  }
-  digitalWrite(PIN_RELAY_CH2, on ? HIGH : LOW);
-}
-
-void set_fill_solenoid(bool on) {
-  // Safety interlock: prevent fill solenoid activation during brew
-  if (on && brewActive) {
-    Serial.println("INTERLOCK: Fill solenoid blocked - brew active");
-    return;
-  }
-  digitalWrite(PIN_RELAY_CH3, on ? HIGH : LOW);
-}
-
-void set_boiler_element(bool on) {
-#ifdef BENCH_MODE
-  // Bench mode: block heater relay, keep it OFF regardless of PID request
-  digitalWrite(PIN_RELAY_CH4, LOW);
-  setBoilerHeatingState(false);
-#else
-  digitalWrite(PIN_RELAY_CH4, on ? HIGH : LOW);
-  setBoilerHeatingState(on);
-#endif
-}
-
-// Legacy function for compatibility
-void set_ssr(bool on) {
-  set_boiler_element(on);
-}
-
-// --- Fill System Functions ---
-bool readFillProbe() {
-  // Read fill probe analog value with hysteresis to prevent chattering
-  int analogValue = analogRead(PIN_FILL_PROBE);
-
-  // Smart fill probe hysteresis
-  static bool probeStateEstablished = false;
-  const int hysteresis = 20;  // ADC counts hysteresis band
-
-  if (!probeStateEstablished) {
-    // Initial state determination
-    fillProbeWet = (analogValue > fillProbeThreshold + hysteresis);
-    probeStateEstablished = true;
-  } else {
-    // Hysteresis logic to prevent chattering
-    if (fillProbeWet && analogValue < fillProbeThreshold - hysteresis) {
-      fillProbeWet = false;  // Transition to dry
-    } else if (!fillProbeWet && analogValue > fillProbeThreshold + hysteresis) {
-      fillProbeWet = true;  // Transition to wet
-    }
-    // No change if within hysteresis band
-  }
-
-  return fillProbeWet;
-}
-
-int readFillProbeRaw() {
-  // Read raw analog value from fill probe for calibration
-  return analogRead(PIN_FILL_PROBE);
-}
-
-void initFillSystem() {
-  pinMode(PIN_FILL_PROBE, INPUT);
-  pinMode(PIN_RELAY_CH3, OUTPUT);  // Fill Solenoid
-  digitalWrite(PIN_RELAY_CH3, LOW);
-  fillProbeWet = readFillProbe();
-  Serial.printf("Fill system initialized. Probe: %s\n", fillProbeWet ? "WET" : "DRY");
-}
-
-// Startup fill cycle - runs during setup() to top off the steam boiler at boot.
-// Only called when boilerFilled=true (fill probe previously calibrated and boiler
-// has been filled at least once). Blocking operation — completes before main loop.
-// On fresh install this is skipped; user fills via the web UI calibration flow.
-void runStartupFillCycle() {
-  // Check if boiler already has water
-  if (readFillProbe()) {
-    Serial.println("Steam boiler already filled - skipping startup fill");
-    boilerFilled = true;
-    return;
-  }
-
-  Serial.println("Steam boiler needs water - starting fill cycle");
-
-  // Fill cycle with timeout protection
-  const unsigned long STARTUP_FILL_TIMEOUT = 120000;  // 2 minute max
-  const unsigned long FILL_CYCLE_DURATION = 2000;     // 2 second pump cycles
-  unsigned long startTime = millis();
-  unsigned long cycleStart = millis();
-  bool pumpOn = true;
-
-  set_fill_solenoid(true);
-  set_pump(true);
-
-  while (millis() - startTime < STARTUP_FILL_TIMEOUT) {
-    // Feed watchdog during fill
-    esp_task_wdt_reset();
-
-    // Check if water detected
-    if (readFillProbe()) {
-      set_fill_solenoid(false);
-      set_pump(false);
-      boilerFilled = true;
-      Serial.printf("Startup fill complete in %lu seconds\n", (millis() - startTime) / 1000);
-      return;
-    }
-
-    // Cycle pump on/off every 2 seconds for accurate probe reading
-    if (millis() - cycleStart >= FILL_CYCLE_DURATION) {
-      pumpOn = !pumpOn;
-      set_pump(pumpOn);
-      set_fill_solenoid(pumpOn);
-      cycleStart = millis();
-
-      if (!pumpOn) {
-        // Brief pause while pump is off to let water settle for probe reading
-        delay(100);
-        if (readFillProbe()) {
-          set_fill_solenoid(false);
-          set_pump(false);
-          boilerFilled = true;
-          Serial.printf("Startup fill complete in %lu seconds\n", (millis() - startTime) / 1000);
-          return;
-        }
-      }
-    }
-
-    delay(50);  // Small delay to prevent tight loop
-  }
-
-  // Timeout reached
-  set_fill_solenoid(false);
-  set_pump(false);
-  Serial.println("WARNING: Startup fill timeout - steam boiler may not be full");
-  Serial.println("Check water supply and fill probe. System will continue but monitor steam boiler.");
-}
+// runStartupFillCycle() removed — startup fill is now handled non-blocking
+// by the normal FILL state machine (startFillRoutine()/updateFillRoutine()),
+// with pendingStartupFillGrace giving the first post-boot attempt the same
+// 120s timeout this blocking version used to. See setup() and
+// updateFillRoutine() for the rest of this change.
 
 // --- Brew Switch Functions ---
 bool readBrewSwitch() {
@@ -2012,9 +1163,7 @@ void startBrewRoutine() {
   preInfusionStartTime = millis();
 
   // Reset PID integral at brew start to prevent windup carryover between brew cycles
-  portENTER_CRITICAL(&pidMux);
-  pid_integral = 0.0;
-  portEXIT_CRITICAL(&pidMux);
+  resetPidIntegral();
   Serial.println("PID integral reset for new brew cycle");
 
   // Auto-tare scale at brew start (as per requirements: "Brew start should reset shot timer and tare scale")
@@ -2150,25 +1299,32 @@ void startFillRoutine() {
   fillActive = true;
   fillInProgress = true;
   fillStartTime = millis();
+  fillAttemptStartTime = millis();
+
+  // First fill attempt after boot gets the longer startup grace period if
+  // the boiler was already filled before this boot (see pendingStartupFillGrace).
+  currentFillTimeoutMs = pendingStartupFillGrace ? STARTUP_FILL_TIMEOUT : FILL_MAX_DURATION;
+  pendingStartupFillGrace = false;
 
   // Turn on both solenoid and pump together for first 2s cycle
   set_fill_solenoid(true);
   set_pump(true);
 
-  Serial.println("Fill routine started - solenoid and pump ON for 2s cycle");
+  Serial.printf("Fill routine started - solenoid and pump ON for 2s cycle (timeout: %lus)\n", currentFillTimeoutMs / 1000);
 }
 
 void updateFillRoutine() {
   if (!fillInProgress) return;
 
   // Check for maximum fill timeout (safety protection) - using rollover-safe timing
-  if (millisElapsed(fillStartTime, FILL_MAX_DURATION)) {
+  // against fillAttemptStartTime (never reset mid-attempt — see its declaration).
+  if (millisElapsed(fillAttemptStartTime, currentFillTimeoutMs)) {
     // Timeout reached - stop fill routine and log error
     set_fill_solenoid(false);
     set_pump(false);
     fillActive = false;
     fillInProgress = false;
-    Serial.printf("Fill routine timeout after %lu seconds - stopped for safety\n", FILL_MAX_DURATION / 1000);
+    Serial.printf("Fill routine timeout after %lu seconds - stopped for safety\n", currentFillTimeoutMs / 1000);
     return;
   }
 
@@ -2219,81 +1375,10 @@ void updateFillRoutine() {
   }
 }
 
-// --- Core 1 PID Task ---
-// Dedicated FreeRTOS task for deterministic PID control
-// Runs on Core 1 with highest priority for real-time performance
-void pidTask(void* parameter) {
-  TickType_t xLastWakeTime = xTaskGetTickCount();
-  const TickType_t xFrequency = pdMS_TO_TICKS(CONTROL_INTERVAL_MS);  // 100ms
+// pidTask()/checkPIDTiming()/pid_step()/initPIDTask() now live in
+// control_task.cpp (the Core 1 ControlTask).
 
-  pidTaskRunning = true;
-  Serial.println("PID Task started on Core 1");
-  // Register PID task with watchdog to catch stalls
-  if (esp_task_wdt_add(NULL) != ESP_OK) {
-    Serial.println("WARNING: Failed to add PID task to watchdog");
-  }
-
-  for (;;) {
-    // Wait for next cycle (precise timing with vTaskDelayUntil)
-    vTaskDelayUntil(&xLastWakeTime, xFrequency);
-    // Feed watchdog for PID task
-    esp_task_wdt_reset();
-
-    // Check if required calibrations are complete before running PID
-  if (!isPidAllowed()) {
-      // Setup not complete - disable PID heating, only read temperature
-      set_boiler_element(false);
-      setCurrentPIDOutputPercent(0.0);
-      
-      // Reset PID integral to prevent windup accumulation during setup
-      // This ensures clean PID response when setup completes
-      portENTER_CRITICAL(&pidMux);
-      pid_integral = 0.0;
-      portEXIT_CRITICAL(&pidMux);
-
-    // Use cached temp for display (main loop handles SPI reads)
-    setTemp(getCachedRawTemp());
-      continue;
-    }
-
-    // Execute PID control (updates currentTemp internally)
-    pid_step();
-  }
-}
-
-// --- Performance Monitoring Functions ---
-void checkPIDTiming() {
-  if (!performanceMonitoringEnabled) return;
-
-  unsigned long currentTime = millis();
-
-  if (lastPIDTime > 0) {
-    unsigned long pidJitter = currentTime - lastPIDTime;
-
-    // Track maximum jitter
-    if (pidJitter > maxPIDJitter) {
-      maxPIDJitter = pidJitter;
-    }
-
-    // Alert on excessive jitter (set flag for main loop to log)
-    if (pidJitter > PID_JITTER_THRESHOLD) {
-      pidJitterCount++;
-      if (!pidTimingWarningActive) {
-        pidLogJitter = pidJitter;
-        pidLogJitterCount = pidJitterCount;
-        pidLogTimingWarning = true;
-        pidTimingWarningActive = true;
-      }
-    } else if (pidTimingWarningActive && pidJitter <= 102) {
-      // Clear warning when timing returns to normal
-      pidTimingWarningActive = false;
-      pidLogTimingNormalized = true;
-    }
-  }
-
-  lastPIDTime = currentTime;
-}
-
+// --- Performance Monitoring Functions (memory/web metrics stay on Core 0) ---
 void checkMemoryUsage() {
   if (!performanceMonitoringEnabled) return;
 
@@ -2343,850 +1428,17 @@ void logPerformanceMetrics() {
   Serial.println("==========================");
 }
 
-// --- PID Control Function (called from Core 1 timer ISR context) ---
-void pid_step() {
-  // Performance monitoring - PID timing check
-  checkPIDTiming();
-
-  // Safety override FIRST - stop heating/pumping for critical errors before any computation
-  // Use atomic error flags for thread-safe access from PID task on Core 1
-  if (hasCriticalErrorFlag()) {
-    setCurrentPIDOutputPercent(0.0);
-    set_boiler_element(false);
-    if (hasErrorFlag(ERR_FLAG_TEMP)) {
-      set_pump(false);
-    }
-    // Still update display temp from cache so UI stays current during error
-    setTemp(getCachedRawTemp());
-    return;
-  }
-
-  // Use cached raw temperature from main loop (avoids SPI access from PID task on Core 1)
-  double temp = getCachedRawTemp();
-
-  // Temperature rate-of-change safety check (uses unified MAX_TEMP_RATE constant)
-  static double lastPidTemp = 77.0;
-  static unsigned long lastPidTempTime = 0;
-
-  unsigned long now = millis();
-  if (lastPidTempTime > 0) {
-    double timeDiff = (now - lastPidTempTime) / 1000.0;  // seconds
-    if (timeDiff > 0) {
-      double tempRate = abs(temp - lastPidTemp) / timeDiff;
-      if (tempRate > MAX_TEMP_RATE) {
-        // Set flag for main loop to log (avoid Serial from PID task)
-        pidLogTempRate = tempRate;
-        pidLogTempRateError = true;
-        setErrorFlag(ERR_FLAG_TEMP);
-        return;  // Exit PID control - use last valid temperature
-      }
-    }
-  }
-
-  // Store previous temperature BEFORE updating for derivative calculation
-  double prevPidTemp = lastPidTemp;
-  lastPidTemp = temp;
-  lastPidTempTime = now;
-
-  // Exponential moving average temperature filtering using TEMP_FILTER_ALPHA constant
-  static double filteredTemp = 77.0;  // Initialize to room temperature
-  static bool firstReading = true;
-
-  if (firstReading) {
-    filteredTemp = temp;
-    firstReading = false;
-  } else {
-    filteredTemp = TEMP_FILTER_ALPHA * temp + (1.0 - TEMP_FILTER_ALPHA) * filteredTemp;
-  }
-
-  // Update global currentTemp with filtered value (thread-safe for main loop access)
-  setTemp(filteredTemp);
-
-  // PID Boost override during brew (100% heater for configurable duration)
-  // Temperature guard: only apply boost if below setpoint + 5°F to prevent overshoot
-  const double PID_BOOST_TEMP_MARGIN = 5.0;
-  if (getPidBoostActive() && getState() == STATE_BREW_ACTIVE &&
-      filteredTemp < (getSetpointTemp() + PID_BOOST_TEMP_MARGIN)) {
-    setCurrentPIDOutputPercent(100.0);  // Show 100% during PID boost
-    set_boiler_element(true);
-    return;
-  }
-
-  double error = getSetpointTemp() - filteredTemp;
-
-  // Snapshot gains before the pidMux critical section — avoids nesting the
-  // inputsMux (inside getKp/getKi/getKd) inside pidMux, same pattern already
-  // used elsewhere in this file for mutex-protected values.
-  double snapKp = getKp();
-  double snapKi = getKi();
-  double snapKd = getKd();
-
-  portENTER_CRITICAL(&pidMux);
-  pid_integral += error * (CONTROL_INTERVAL_MS / 1000.0);
-
-  // PID integral windup protection
-  if (pid_integral > integralMax) pid_integral = integralMax;
-  if (pid_integral < -integralMax) pid_integral = -integralMax;
-
-  // Use derivative on measurement (not error) to prevent "derivative kick" on setpoint changes
-  // Negative sign because we're measuring temperature change, not error change
-  // Uses prevPidTemp (stored before update) to get actual temperature rate of change
-  double derivative = -(filteredTemp - prevPidTemp) / (CONTROL_INTERVAL_MS / 1000.0);
-  pidOutput = snapKp * error + snapKi * pid_integral + snapKd * derivative;
-  // Note: pid_prev_error kept for potential future use, but derivative now uses measurement
-  pid_prev_error = error;
-  portEXIT_CRITICAL(&pidMux);
-
-  // Map pidOutput to 0..1 via clamp and scaling
-  // PID_OUTPUT_SCALE of 1000.0 means:
-  // - With Kp=40, a 25°F error produces P-term = 1000 = 100% output
-  // - With Ki=0.8 and max integral=1000, I-term maxes at 800 = 80% output
-  // - With Kd=120, a 5°F/s rate produces D-term = 600 = 60% output
-  const double PID_OUTPUT_SCALE = 1000.0;
-  double out = pidOutput / PID_OUTPUT_SCALE;
-  if (out > 1.0) out = 1.0;
-  if (out < 0.0) out = 0.0;
-
-  // Update PID output percentage for display
-  setCurrentPIDOutputPercent(out * 100.0);
-
-  // Time-proportional burst-fire control (fixed 1s window)
-  const unsigned long window_ms = 1000;  // 1s window as required
-  static unsigned long window_start = millis();
-  if (millisElapsed(window_start, window_ms)) window_start = millis();
-
-  // Bounds checking to prevent overflow from negative PID output
-  if (out < 0.0) out = 0.0;  // Prevent negative values from integral windup
-  if (out > 1.0) out = 1.0;  // Prevent output > 100%
-
-  unsigned long on_time = (unsigned long)(out * window_ms);
-
-  // Single state change per window
-  if (!millisElapsed(window_start, on_time)) set_boiler_element(true);
-  else set_boiler_element(false);
-}
-
-// --- Initialize PID Task on Core 1 ---
-void initPIDTask() {
-  // Create dedicated PID task on Core 1 with highest priority
-  // Priority 24 is highest for application tasks (configMAX_PRIORITIES - 1)
-  // Stack size 6144 bytes provides margin for PID calculations and safety checks
-  BaseType_t result = xTaskCreatePinnedToCore(
-    pidTask,         // Task function
-    "PIDTask",       // Task name
-    6144,            // Stack size (bytes) - increased for safety margin
-    NULL,            // Parameters
-    24,              // Priority (highest for real-time control)
-    &pidTaskHandle,  // Task handle
-    1                // Core 1 (dedicated to PID)
-  );
-
-  if (result != pdPASS) {
-    Serial.println("ERROR: Failed to create PID task on Core 1");
-    return;
-  }
-
-  Serial.println("PID Task created on Core 1 (100ms interval, highest priority)");
-}
-
-// --- EEPROM Functions ---
-void writeFloatToEEPROM(int address, float value) {
-  byte* p = (byte*)(void*)&value;
-  for (int i = 0; i < sizeof(value); i++) {
-    EEPROM.write(address + i, *p++);
-  }
-}
-
-float readFloatFromEEPROM(int address) {
-  float value = 0.0;
-  byte* p = (byte*)(void*)&value;
-  for (int i = 0; i < sizeof(value); i++) {
-    *p++ = EEPROM.read(address + i);
-  }
-  return value;
-}
-
-void writeUint16ToEEPROM(int address, uint16_t value) {
-  EEPROM.write(address, value & 0xFF);
-  EEPROM.write(address + 1, (value >> 8) & 0xFF);
-}
-
-uint16_t readUint16FromEEPROM(int address) {
-  uint16_t value = EEPROM.read(address);
-  value |= (EEPROM.read(address + 1) << 8);
-  return value;
-}
-
-void saveParametersToEEPROM() {
-  // Enhanced protection: Only save when system is in safe state
-  if (currentState == STATE_BREW_ACTIVE || currentState == STATE_BREW_START || currentState == STATE_BREW_END || currentState == STATE_FILL) {
-    Serial.println("Cannot save parameters during active operations");
-    return;
-  }
-
-  // Additional safety check: Ensure no critical errors are active
-  if (isCriticalError()) {
-    Serial.println("Cannot save parameters during critical error state");
-    return;
-  }
-
-  // Re-entrancy guard (all callers are on Core 0, no spinlock needed)
-  static volatile bool eepromSaveInProgress = false;
-  if (eepromSaveInProgress) {
-    Serial.println("EEPROM save already in progress - skipping");
-    return;
-  }
-  eepromSaveInProgress = true;
-
-  // Snapshot mutex-protected values BEFORE any long operations
-  // This avoids nested critical sections (S-3) and keeps flash writes outside spinlocks (S-2)
-  double snapSetpointTemp = getSetpointTemp();
-  bool snapAllowUnsafePid = getAllowUnsafePid();
-  double snapKp = getKp();
-  double snapKi = getKi();
-  double snapKd = getKd();
-
-  // Write signature
-  writeUint16ToEEPROM(ADDR_SIGNATURE, EEPROM_SIGNATURE);
-
-  // Write parameters (using snapshots for mutex-protected values)
-  writeFloatToEEPROM(ADDR_BREW_TEMP, snapSetpointTemp);
-  writeFloatToEEPROM(ADDR_SHOT_TIME, shotTargetTime);
-  writeFloatToEEPROM(ADDR_SHOT_WEIGHT, shotTargetWeight);
-  writeFloatToEEPROM(ADDR_PREINFUSION, preInfusionDuration);
-  writeFloatToEEPROM(ADDR_SCALE_CAL, scaleCalibrationFactor);
-  writeFloatToEEPROM(ADDR_PID_BOOST, pidBoostDuration);
-  writeFloatToEEPROM(ADDR_PID_KP, snapKp);
-  writeFloatToEEPROM(ADDR_PID_KI, snapKi);
-  writeFloatToEEPROM(ADDR_PID_KD, snapKd);
-  EEPROM.put(ADDR_FILL_THRESHOLD, fillProbeThreshold);
-  writeFloatToEEPROM(ADDR_PREINFUSION_RATE, preInfusionPulseRate);
-  writeFloatToEEPROM(ADDR_PRESSURE_OFFSET, pressureOffset);
-  writeFloatToEEPROM(ADDR_PRESSURE_SCALE, pressureScale);
-  writeFloatToEEPROM(ADDR_DOSE_WEIGHT, doseWeight);
-  EEPROM.put(ADDR_SCALE_ZERO_OFFSET, scaleZeroOffset);
-  EEPROM.put(ADDR_CLEANING_CYCLES, cleaningCycleCount);
-
-  // Write setup state flags (using snapshot for mutex-protected value)
-  EEPROM.write(ADDR_SETUP_COMPLETE, setupComplete ? 1 : 0);
-  EEPROM.write(ADDR_TEMP_CAL_COMPLETE, tempCalComplete ? 1 : 0);
-  EEPROM.write(ADDR_PRESSURE_CAL_COMPLETE, pressureCalComplete ? 1 : 0);
-  EEPROM.write(ADDR_BOILER_FILLED, boilerFilled ? 1 : 0);
-  EEPROM.write(ADDR_ALLOW_UNSAFE_PID, snapAllowUnsafePid ? 1 : 0);
-  EEPROM.write(ADDR_SCALE_CAL_COMPLETE, scaleCalComplete ? 1 : 0);
-
-  // Flash write - safe outside critical section
-  EEPROM.commit();
-
-  // Verify write operation
-  uint16_t verifySignature = readUint16FromEEPROM(ADDR_SIGNATURE);
-  if (verifySignature != EEPROM_SIGNATURE) {
-    Serial.println("ERROR: EEPROM write verification failed");
-    eepromSaveInProgress = false;
-    return;
-  }
-
-  eepromSaveInProgress = false;
-  Serial.println("Parameters saved to EEPROM (including PID gains and fill threshold) - verified");
-}
-
-bool loadParametersFromEEPROM() {
-  // Check signature
-  uint16_t signature = readUint16FromEEPROM(ADDR_SIGNATURE);
-  if (signature != EEPROM_SIGNATURE) {
-    Serial.println("EEPROM signature invalid, using defaults");
-    return false;
-  }
-
-  // Load parameters
-  setSetpointTemp(readFloatFromEEPROM(ADDR_BREW_TEMP));
-  originalSetpointTemp = getSetpointTemp();  // Initialize original setpoint for compensation
-  shotTargetTime = readFloatFromEEPROM(ADDR_SHOT_TIME);
-  shotTargetWeight = readFloatFromEEPROM(ADDR_SHOT_WEIGHT);
-  preInfusionDuration = readFloatFromEEPROM(ADDR_PREINFUSION);
-  scaleCalibrationFactor = readFloatFromEEPROM(ADDR_SCALE_CAL);
-  pidBoostDuration = readFloatFromEEPROM(ADDR_PID_BOOST);
-  setKp(readFloatFromEEPROM(ADDR_PID_KP));
-  setKi(readFloatFromEEPROM(ADDR_PID_KI));
-  setKd(readFloatFromEEPROM(ADDR_PID_KD));
-  EEPROM.get(ADDR_FILL_THRESHOLD, fillProbeThreshold);
-  preInfusionPulseRate = readFloatFromEEPROM(ADDR_PREINFUSION_RATE);
-  pressureOffset = readFloatFromEEPROM(ADDR_PRESSURE_OFFSET);
-  pressureScale = readFloatFromEEPROM(ADDR_PRESSURE_SCALE);
-  doseWeight = readFloatFromEEPROM(ADDR_DOSE_WEIGHT);
-  EEPROM.get(ADDR_SCALE_ZERO_OFFSET, scaleZeroOffset);
-  EEPROM.get(ADDR_CLEANING_CYCLES, cleaningCycleCount);
-
-  // Load setup state flags
-  setupComplete = (EEPROM.read(ADDR_SETUP_COMPLETE) == 1);
-  tempCalComplete = (EEPROM.read(ADDR_TEMP_CAL_COMPLETE) == 1);
-  pressureCalComplete = (EEPROM.read(ADDR_PRESSURE_CAL_COMPLETE) == 1);
-  boilerFilled = (EEPROM.read(ADDR_BOILER_FILLED) == 1);
-  setAllowUnsafePid(EEPROM.read(ADDR_ALLOW_UNSAFE_PID) == 1);
-  scaleCalComplete = (EEPROM.read(ADDR_SCALE_CAL_COMPLETE) == 1);
-
-  // Update setupComplete based on required calibrations
-  recomputeSetupComplete();
-
-  // Validate parameter ranges
-  if (getSetpointTemp() < 180.0 || getSetpointTemp() > 220.0) {
-    setSetpointTemp(200.0);
-    originalSetpointTemp = 200.0;
-  }
-  if (shotTargetTime < 0 || shotTargetTime > 60.0) shotTargetTime = 30.0;
-  if (shotTargetWeight < 0 || shotTargetWeight > 60.0) shotTargetWeight = 36.0;
-  if (preInfusionDuration < 0 || preInfusionDuration > shotTargetTime) preInfusionDuration = 8.0;
-  if (pidBoostDuration < 0 || pidBoostDuration > shotTargetTime) pidBoostDuration = 4.0;
-  if (scaleCalibrationFactor < 0.1 || scaleCalibrationFactor > 10.0) scaleCalibrationFactor = 1.0;
-  if (getKp() < 0.1 || getKp() > 200.0) setKp(40.0);
-  if (getKi() < 0.0 || getKi() > 10.0) setKi(0.8);
-  if (getKd() < 0.0 || getKd() > 500.0) setKd(120.0);
-  if (fillProbeThreshold < 100 || fillProbeThreshold > 900) fillProbeThreshold = 512;
-  if (preInfusionPulseRate < 100 || preInfusionPulseRate > 1000) preInfusionPulseRate = 500;  // 100-1000ms range, user configurable
-  if (pressureOffset < -1.0 || pressureOffset > 4.0) pressureOffset = 0.0;  // Voltage units (0-3.3V range)
-  if (pressureScale < 0.1 || pressureScale > 100.0) pressureScale = 1.0;
-  if (doseWeight < 10.0 || doseWeight > 30.0) doseWeight = 18.0;
-  if (cleaningCycleCount < 1 || cleaningCycleCount > 20) cleaningCycleCount = 10;
-
-  Serial.println("Parameters loaded from EEPROM");
-  Serial.printf("Brew Temp: %.1f°F, Shot Time: %.1fs, Shot Weight: %.1fg\n",
-                getSetpointTemp(), shotTargetTime, shotTargetWeight);
-  Serial.printf("Pre-infusion: %.1fs, PID Boost: %.1fs, Scale Cal: %.2f\n",
-                preInfusionDuration, pidBoostDuration, scaleCalibrationFactor);
-  Serial.printf("PID Gains: Kp=%.1f, Ki=%.2f, Kd=%.1f, Fill Threshold=%d\n",
-                getKp(), getKi(), getKd(), (int)fillProbeThreshold);
-
-  return true;
-}
-
-void initEEPROM() {
-  EEPROM.begin(EEPROM_SIZE);
-
-  if (!loadParametersFromEEPROM()) {
-    // First time setup - save defaults
-    Serial.println("First time setup - saving default parameters");
-    saveParametersToEEPROM();
-  }
-}
-
-// --- Web server handlers ---
-void handleRoot() {
-  // Stream HTML components directly to avoid large heap allocation
-  // This eliminates the need for 48KB memory reservation
-  
-  // Start HTTP response
-  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
-  server.send(200, "text/html", "");
-  
-  // Stream each PROGMEM component directly to client (no heap allocation)
-  server.sendContent_P(web_ui_html);           // HTML head + opening style tag
-  server.sendContent_P(bootstrap_css);         // Bootstrap CSS  
-  server.sendContent_P(web_ui_css);            // Custom CSS
-  server.sendContent_P(web_ui_html_body);      // HTML body structure
-  server.sendContent_P(web_ui_js);             // JavaScript functionality
-  server.sendContent_P(bootstrap_js);          // Bootstrap JS
-  server.sendContent_P(apexcharts_js);         // ApexCharts JS  
-  server.sendContent_P(web_ui_html_footer);    // Closing tags
-  
-  // End response
-  server.sendContent("");
-}
-
-
-// JSON status endpoint with compression (only send changed values)
-void handleStatus() {
-  unsigned long requestStartTime = millis();
-  webRequestCount++;
-
-  buildStatusJSON(jsonStatusBuffer, sizeof(jsonStatusBuffer), true);
-  server.send(200, "application/json", jsonStatusBuffer);
-
-  unsigned long responseTime = millis() - requestStartTime;
-  totalWebResponseTime += responseTime;
-  if (responseTime > maxWebResponseTime) {
-    maxWebResponseTime = responseTime;
-  }
-  if (responseTime > 500) {
-    Serial.printf("SLOW WEB RESPONSE: %lums for /status request\n", responseTime);
-  }
-}
-
-// Handle tare scale request
-void handleTare() {
-  tareScale();
-  server.send(200, "text/plain", "Scale tared");
-}
-
-// Calibration web handlers
-// Map CalStep enum to JSON-compatible string
-const char* calStepName(CalStep s) {
-  switch (s) {
-    case CAL_FILL_DRY:      return "FILL_DRY";
-    case CAL_FILL_WET:      return "FILL_WET";
-    case CAL_SCALE_ZERO:    return "SCALE_ZERO";
-    case CAL_SCALE_WEIGHT:  return "SCALE_WEIGHT";
-    case CAL_SCALE_CONFIRM: return "SCALE_CONFIRM";
-    case CAL_PRESSURE_ZERO: return "ZERO";
-    case CAL_PRESSURE_HIGH: return "HIGH";
-    default:                return "";
-  }
-}
-
-void handleCalibrateStatus() {
-  static char jsonBuffer[512];
-  const char* instructions = "";
-
-  switch (calStep) {
-    case CAL_FILL_DRY:      instructions = "Ensure fill probe is completely DRY, then click Next Step"; break;
-    case CAL_FILL_WET:      instructions = "Immerse fill probe in water until WET, then click Next Step"; break;
-    case CAL_SCALE_ZERO:    instructions = "Remove all weight from scale, then click Next Step"; break;
-    case CAL_SCALE_WEIGHT:  instructions = "Place known weight on scale, then click Next Step"; break;
-    case CAL_SCALE_CONFIRM: instructions = "Enter the known weight value and click Complete Scale Cal"; break;
-    case CAL_PRESSURE_ZERO: instructions = "Ensure system at ZERO pressure (pump OFF), then click Next Pressure Step"; break;
-    case CAL_PRESSURE_HIGH: instructions = "1) Enter actual pressure reading from analog gauge in 'Actual Pressure' field. 2) Use 'Start Pump (Cal)' to pressurize. 3) Click 'Set Pressure Value' to confirm reading. 4) Click 'Next Pressure Step' to complete."; break;
-    default: break;
-  }
-
-  const char* stepStr = calStepName(calStep);
-  // Derive fill/scale active and pressure active from unified calStep
-  bool fillScaleActive = isFillScaleCal();
-  bool pressureActive = isPressureCal();
-  const char* pressureStepStr = pressureActive ? stepStr : "";
-  const char* fillScaleStepStr = fillScaleActive ? stepStr : "";
-
-  snprintf(jsonBuffer, sizeof(jsonBuffer),
-           "{\"active\":%s,\"step\":\"%s\",\"instructions\":\"%s\",\"pressureCalActive\":%s,\"pressureCalStep\":\"%s\"}",
-           fillScaleActive ? "true" : "false",
-           fillScaleStepStr,
-           instructions,
-           pressureActive ? "true" : "false",
-           pressureStepStr);
-
-  server.send(200, "application/json", jsonBuffer);
-}
-
-void handleCalibrateFillStart() {
-  startFillProbeCalibration();
-  server.send(200, "text/plain", "Fill probe calibration started");
-}
-
-void handleCalibrateScaleStart() {
-  startScaleCalibration();
-  server.send(200, "text/plain", "Scale calibration started");
-}
-
-void handleCalibrateNext() {
-  CalStep before = calStep;
-  processCalibrationStep();
-  if (calStep != before) {
-    server.send(200, "text/plain", "Calibration step processed");
-  } else if (!isFillScaleCal()) {
-    server.send(400, "text/plain", "No active fill/scale calibration");
-  } else {
-    server.send(500, "text/plain", "Step failed - check hardware connection");
-  }
-}
-
-void handleCalibrateScaleComplete() {
-  if (server.hasArg("weight")) {
-    float weight = server.arg("weight").toFloat();
-    if (weight > 0) {
-      completeScaleCalibration(weight);
-      server.send(200, "text/plain", "Scale calibration completed");
-    } else {
-      server.send(400, "text/plain", "Invalid weight value");
-    }
-  } else {
-    server.send(400, "text/plain", "Missing weight parameter");
-  }
-}
-
-void handleCalibratePressureStart() {
-  startPressureCalibration();
-  server.send(200, "text/plain", "Pressure calibration started");
-}
-
-void handleCalibratePressureNext() {
-  if (isPressureCal()) {
-    processPressureCalibrationStep();
-    server.send(200, "text/plain", "Pressure calibration step processed");
-  } else {
-    server.send(400, "text/plain", "No active pressure calibration");
-  }
-}
-
-void handleCalibratePumpStart() {
-  if (calStep == CAL_PRESSURE_HIGH) {
-    set_pump(true);
-    Serial.println("Calibration pump started for HIGH pressure step");
-    server.send(200, "text/plain", "Calibration pump started");
-  } else if (!isPressureCal()) {
-    server.send(400, "text/plain", "Pressure calibration not active");
-  } else {
-    server.send(400, "text/plain", "Pump only available during HIGH pressure step");
-  }
-}
-
-void handleCalibratePumpStop() {
-  if (isPressureCal()) {
-    set_pump(false);
-    Serial.println("Calibration pump stopped");
-    server.send(200, "text/plain", "Calibration pump stopped");
-  } else {
-    server.send(400, "text/plain", "Pressure calibration not active");
-  }
-}
-
-// Temperature calibration confirmation - user verifies probe reading is accurate
-void handleCalibrateTempComplete() {
-  // Read current temperature for verification display
-  float temp = read_boiler_temp();
-
-  if (temp > 0 && temp < 300) {  // Sanity check - valid temp range
-    tempCalComplete = true;
-    recomputeSetupComplete();
-    eepromDirty = true;
-
-    char response[128];
-    snprintf(response, sizeof(response),
-             "{\"success\":true,\"temperature\":%.1f,\"setupComplete\":%s}",
-             temp, setupComplete ? "true" : "false");
-    server.send(200, "application/json", response);
-    Serial.printf("Temperature calibration confirmed at %.1f°F\n", temp);
-  } else {
-    server.send(400, "application/json", "{\"success\":false,\"error\":\"Invalid temperature reading\"}");
-  }
-}
-
-void handleSetPressureCalibrationValue() {
-  if (server.hasArg("pressure")) {
-    double newPressure = server.arg("pressure").toFloat();
-    if (newPressure >= 1.0 && newPressure <= 15.0) {
-      pressureHighValue = newPressure;
-      Serial.printf("Pressure calibration value set to %.1f BAR\n", pressureHighValue);
-      server.send(200, "text/plain", "Pressure calibration value updated");
-    } else {
-      server.send(400, "text/plain", "Invalid pressure value (must be 1-15 BAR)");
-    }
-  } else {
-    server.send(400, "text/plain", "Missing pressure parameter");
-  }
-}
-
-// Cancel any active calibration and return to idle
-void handleCalibrateCancel() {
-  if (calStep == CAL_IDLE) {
-    server.send(400, "text/plain", "No active calibration to cancel");
-    return;
-  }
-
-  // Safety: turn off pump if pressure calibration was active
-  if (isPressureCal()) {
-    set_pump(false);
-  }
-
-  Serial.printf("Calibration cancelled (was at step %d)\n", calStep);
-  calStep = CAL_IDLE;
-  server.send(200, "text/plain", "Calibration cancelled");
-}
-
-void handleSetpoint() {
-  if (server.hasArg("sp")) {
-    double newTemp = server.arg("sp").toFloat();
-    if (newTemp >= 180.0 && newTemp <= 220.0) {
-      setSetpointTemp(newTemp);
-      originalSetpointTemp = newTemp;
-      eepromDirty = true;
-      server.send(200, "text/plain", "OK");
-    } else {
-      server.send(400, "text/plain", "Temperature out of range (180-220°F)");
-    }
-  } else {
-    server.send(400, "text/plain", "Missing sp param");
-  }
-}
-
-void handleSetDoseWeight() {
-  if (server.hasArg("dose")) {
-    double newDose = server.arg("dose").toFloat();
-    if (newDose >= 10.0 && newDose <= 30.0) {
-      doseWeight = newDose;
-      eepromDirty = true;
-      server.send(200, "text/plain", "OK");
-    } else {
-      server.send(400, "text/plain", "Dose weight out of range (10-30g)");
-    }
-  } else {
-    server.send(400, "text/plain", "Missing dose param");
-  }
-}
-
-// Unified shot parameters handler — accepts any combination of brewTemp, shotTargetTime, doseWeight, shotTargetWeight
-void handleSetParams() {
-  bool updated = false;
-
-  if (server.hasArg("brewTemp")) {
-    double val = server.arg("brewTemp").toFloat();
-    if (val >= 180.0 && val <= 220.0) {
-      setSetpointTemp(val);
-      originalSetpointTemp = val;
-      updated = true;
-    } else {
-      server.send(400, "text/plain", "Brew temp out of range (180-220°F)");
-      return;
-    }
-  }
-
-  if (server.hasArg("shotTargetTime")) {
-    double val = server.arg("shotTargetTime").toFloat();
-    if (val >= 0.0 && val <= 60.0) {
-      shotTargetTime = val;
-      // Clamp dependent params if they now exceed target time
-      if (preInfusionDuration > shotTargetTime) preInfusionDuration = shotTargetTime;
-      if (pidBoostDuration > shotTargetTime) pidBoostDuration = shotTargetTime;
-      updated = true;
-    } else {
-      server.send(400, "text/plain", "Shot target time out of range (0-60s)");
-      return;
-    }
-  }
-
-  if (server.hasArg("doseWeight")) {
-    double val = server.arg("doseWeight").toFloat();
-    if (val >= 10.0 && val <= 30.0) {
-      doseWeight = val;
-      updated = true;
-    } else {
-      server.send(400, "text/plain", "Dose weight out of range (10-30g)");
-      return;
-    }
-  }
-
-  if (server.hasArg("shotTargetWeight")) {
-    double val = server.arg("shotTargetWeight").toFloat();
-    if (val >= 0.0 && val <= 60.0) {
-      shotTargetWeight = val;
-      updated = true;
-    } else {
-      server.send(400, "text/plain", "Shot target weight out of range (0-60g)");
-      return;
-    }
-  }
-
-  if (updated) {
-    eepromDirty = true;
-    server.send(200, "text/plain", "Parameters saved");
-  } else {
-    server.send(400, "text/plain", "No valid parameters provided");
-  }
-}
-
-// Kp/Ki/Kd now live behind mutex-protected accessors in shared_state.cpp
-// (not bare globals), so ParamDef takes a setter function pointer instead of
-// a raw double* — this is what actually closes off the ability to write
-// these three gains without going through the lock.
-static void setPidBoostDurationParam(double v) { pidBoostDuration = v; }
-static void setPreInfusionDurationParam(double v) { preInfusionDuration = v; }
-static void setPreInfusionPulseRateParam(double v) { preInfusionPulseRate = v; }
-
-struct ParamDef {
-  const char* argName;
-  void (*setter)(double);
-  double min;
-  double max;          // 0 means use shotTargetTime as dynamic max
-  const char* label;
-  const char* fmt;     // printf format for response (e.g. "%.1f", "%.2f")
-};
-
-static const ParamDef pidParams[] = {
-  {"kp",          setKp,                      0.1,   200.0, "Kp",             "%.1f"},
-  {"ki",          setKi,                      0.0,   10.0,  "Ki",             "%.2f"},
-  {"kd",          setKd,                      0.0,   500.0, "Kd",             "%.1f"},
-  {"boost",       setPidBoostDurationParam,   0.0,   0,     "Boost",          "%.1fs"},
-  {"preinfusion", setPreInfusionDurationParam, 0.0,  0,     "Pre-infusion",   "%.1fs"},
-  {"rate",        setPreInfusionPulseRateParam, 100.0, 1000.0, "Rate",        "%.0fms"},
-};
-
-void handleSetPIDParameters() {
-  bool updated = false;
-  char response[256];
-  int pos = snprintf(response, sizeof(response), "PID parameters updated:");
-
-  for (size_t i = 0; i < sizeof(pidParams) / sizeof(pidParams[0]); i++) {
-    const ParamDef& p = pidParams[i];
-    if (!server.hasArg(p.argName)) continue;
-
-    double val = server.arg(p.argName).toFloat();
-    double maxVal = (p.max == 0) ? shotTargetTime : p.max;
-
-    if (val < p.min || val > maxVal) {
-      char errMsg[64];
-      snprintf(errMsg, sizeof(errMsg), "%s out of range (%.1f-%.1f)", p.label, p.min, maxVal);
-      server.send(400, "text/plain", errMsg);
-      return;
-    }
-
-    p.setter(val);
-    updated = true;
-    pos += snprintf(response + pos, sizeof(response) - pos, " %s=", p.label);
-    pos += snprintf(response + pos, sizeof(response) - pos, p.fmt, val);
-  }
-
-  if (updated) {
-    eepromDirty = true;
-    server.send(200, "text/plain", response);
-  } else {
-    server.send(400, "text/plain", "No valid parameters provided");
-  }
-}
-
-// Safety settings handler (PID bypass during setup)
-void handleSetSafety() {
-  if (server.hasArg("pidBypass")) {
-    int bypassValue = server.arg("pidBypass").toInt();
-    bool enableBypass = (bypassValue == 1);
-    setAllowUnsafePid(enableBypass);
-    eepromDirty = true;
-
-    if (enableBypass) {
-      Serial.println("WARNING: PID bypass enabled - PID may run before setup completes");
-      server.send(200, "text/plain", "PID bypass enabled");
-    } else {
-      Serial.println("PID bypass disabled - setup required for PID");
-      server.send(200, "text/plain", "PID bypass disabled");
-    }
-    return;
-  }
-
-  server.send(400, "text/plain", "Missing pidBypass param (use 1 or 0)");
-}
-
-// Cleaning cycle web handlers
-void handleStartCleaning() {
-  if (currentState != STATE_IDLE) {
-    server.send(400, "text/plain", "Cannot start cleaning - system not in IDLE state");
-    return;
-  }
-
-  if (cleaningActive) {
-    server.send(400, "text/plain", "Cleaning cycle already active");
-    return;
-  }
-
-  // Check fill probe before starting cleaning
-  if (!readFillProbe()) {
-    server.send(400, "text/plain", "Cannot start cleaning - fill steam boiler first");
-    return;
-  }
-
-  startCleaningCycle();
-  server.send(200, "text/plain", "Cleaning cycle started");
-}
-
-void handleStopCleaning() {
-  if (!cleaningActive) {
-    server.send(400, "text/plain", "No active cleaning cycle to stop");
-    return;
-  }
-
-  stopCleaningCycle();
-  changeState(STATE_IDLE);
-  server.send(200, "text/plain", "Cleaning cycle stopped");
-}
-
-// WebSocket event handler
-void webSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length) {
-  switch (type) {
-    case WStype_DISCONNECTED:
-      Serial.printf("WebSocket client #%u disconnected\n", num);
-      break;
-    case WStype_CONNECTED:
-      {
-        IPAddress ip = webSocket.remoteIP(num);
-        Serial.printf("WebSocket client #%u connected from %d.%d.%d.%d\n", num, ip[0], ip[1], ip[2], ip[3]);
-        // Send initial data to new client
-        sendWebSocketData(num);
-        break;
-      }
-    case WStype_TEXT:
-      Serial.printf("WebSocket client #%u sent text: %s\n", num, payload);
-      break;
-    default:
-      break;
-  }
-}
-
-// Unified JSON builder — single source of truth for status JSON
-// includeSetup: true adds setup flags and configuration parameters
-// Returns number of bytes written (excluding null terminator)
-int buildStatusJSON(char* buf, size_t len, bool includeSetup) {
-  double snapTemp = getTemp();
-  double snapSetpoint = getSetpointTemp();
-  double snapPidOutput = getCurrentPIDOutputPercent();
-  bool snapUnsafePid = getAllowUnsafePid();
-  bool snapBoilerHeating = getBoilerHeatingState();
-
-  int pos = snprintf(buf, len,
-    "{\"currentTemp\":%.1f,\"setpointTemp\":%.1f,\"shotTime\":%.1f,\"shotWeight\":%.1f,"
-    "\"currentPressure\":%.1f,\"flowRate\":%.1f,\"currentShotRatio\":%.2f,"
-    "\"doseWeight\":%.1f,\"pidOutput\":%.0f,\"scaleConnected\":%s,"
-    "\"isBrewing\":%s,\"boilerHeating\":%s,\"systemState\":\"%s\","
-    "\"errorMessage\":\"%s\",\"systemMessage\":\"%s\",\"cleaningActive\":%s,\"pidBypass\":%s",
-    snapTemp, snapSetpoint, shotTime, shotWeight,
-    currentPressure, currentFlowRate, currentShotRatio,
-    doseWeight, snapPidOutput,
-    scaleConnected ? "true" : "false",
-    brewActive ? "true" : "false",
-    snapBoilerHeating ? "true" : "false",
-    getStateName(currentState),
-    systemMessage.c_str(), systemMessage.c_str(),
-    cleaningActive ? "true" : "false",
-    snapUnsafePid ? "true" : "false");
-  if (pos < 0 || (size_t)pos >= len) return pos;
-
-  if (includeSetup) {
-    pos += snprintf(buf + pos, len - pos,
-      ",\"firstRun\":%s,\"tempCalComplete\":%s,\"pressureCalComplete\":%s,"
-      "\"scaleCalComplete\":%s,\"boilerFilled\":%s,"
-      "\"brewTemp\":%.1f,\"shotTargetTime\":%.1f,\"shotTargetWeight\":%.1f,"
-      "\"pidKp\":%.1f,\"pidKi\":%.2f,\"pidKd\":%.1f,"
-      "\"pidBoost\":%.1f,\"preInfusion\":%.1f,\"preInfusionRate\":%.0f",
-      setupComplete ? "false" : "true",
-      tempCalComplete ? "true" : "false",
-      pressureCalComplete ? "true" : "false",
-      scaleCalComplete ? "true" : "false",
-      boilerFilled ? "true" : "false",
-      snapSetpoint, shotTargetTime, shotTargetWeight,
-      getKp(), getKi(), getKd(),
-      pidBoostDuration, preInfusionDuration, preInfusionPulseRate);
-    if (pos < 0 || (size_t)pos >= len) return pos;
-  }
-
-  pos += snprintf(buf + pos, len - pos, ",\"uptime\":%lu}", millis());
-  return pos;
-}
-
-// Send WebSocket data to specific client (new connection — include setup)
-void sendWebSocketData(uint8_t clientNum) {
-  buildStatusJSON(webSocketBuffer, sizeof(webSocketBuffer), true);
-  webSocket.sendTXT(clientNum, webSocketBuffer);
-}
-
-// Broadcast WebSocket data to all clients
-void broadcastWebSocketData() {
-  buildStatusJSON(webSocketBuffer, sizeof(webSocketBuffer), false);
-  webSocket.broadcastTXT(webSocketBuffer);
-  webSocketMessageCount++;
-}
-
-// --- FreeRTOS Task Functions ---
-
-// PID Control handled by hardware timer ISR only (per requirements)
-// Core 1 hardware timer ISR fires every 100ms and calls pid_step()
-// No FreeRTOS task needed for PID control
-
-// FreeRTOS tasks removed - using millis() timing in main loop per requirements
-
+// pid_step() and initPIDTask() now live in control_task.cpp.
+
+// writeFloatToEEPROM()/readFloatFromEEPROM()/writeUint16ToEEPROM()/
+// readUint16FromEEPROM()/saveParametersToEEPROM()/loadParametersFromEEPROM()/
+// initEEPROM() now live in eeprom_store.cpp.
+
+// All web server handlers, webSocketEvent(), buildStatusJSON(),
+// sendWebSocketData(), and broadcastWebSocketData() now live in
+// web_api.cpp. The stale "hardware timer ISR" comment that used to sit
+// here (contradicted by control_task.cpp's actual FreeRTOS-task
+// implementation) has been removed.
 // --- Setup & Loop ---
 void setup() {
   Serial.begin(115200);
@@ -3231,15 +1483,26 @@ void setup() {
   // Initialize Fill System — uses fillProbeThreshold loaded from EEPROM above
   initFillSystem();
 
-  // Startup fill cycle — only run if boiler has been filled before (implies fill probe
-  // is calibrated). On fresh install (boilerFilled=false in EEPROM), skip and let the
-  // user complete fill probe calibration via web UI before the fill system operates.
-  if (boilerFilled) {
-    Serial.println("Running startup fill cycle for steam boiler safety...");
-    runStartupFillCycle();
+  // Non-blocking startup fill: rather than running a dedicated blocking loop
+  // here (which used to hold up WiFi/web server startup for up to 2 minutes
+  // on every boot where the steam boiler was dry), let the normal FILL state
+  // machine handle it once SystemTask starts — same behavior, just not
+  // blocking. If the probe is already wet there's nothing to fill, so mark
+  // boilerFilled directly (matching the old "already filled" branch).
+  if (fillProbeWet) {
+    Serial.println("Steam boiler already filled - no startup fill needed");
+    if (!boilerFilled) {
+      boilerFilled = true;
+      eepromDirty = true;
+    }
+  } else if (boilerFilled) {
+    // Boiler was filled before this boot but is dry now — give the first
+    // fill attempt the longer STARTUP_FILL_TIMEOUT grace period.
+    Serial.println("Steam boiler needs water - will fill non-blocking once running (120s grace)");
+    pendingStartupFillGrace = true;
   } else {
-    Serial.println("Startup fill cycle skipped — fresh install or boilerFilled=false");
-    Serial.println("Complete fill probe calibration via web UI before using the fill system");
+    Serial.println("Startup fill: fresh install — fill system will use normal 60s timeout");
+    Serial.println("Complete fill probe calibration via web UI for best accuracy");
   }
 
   // Initialize Brew Switch
@@ -3304,10 +1567,26 @@ void setup() {
   lastFillCheck = millis();
   systemStartTime = millis();
 
+  // Explicitly pin the steady-state workload to Core 0 instead of relying on
+  // wherever the Arduino framework's own setup()/loop() task happens to run —
+  // see SystemTask below. Arduino's loop() becomes an inert stub after this.
+  BaseType_t sysTaskResult = xTaskCreatePinnedToCore(
+    systemTask,        // Task function
+    "SystemTask",      // Task name
+    8192,              // Stack size (bytes) — web server + display + sensors
+    NULL,              // Parameters
+    1,                 // Priority (low — ControlTask's priority 24 always preempts)
+    &systemTaskHandle,  // Task handle
+    0                  // Core 0 — explicit, never assumed
+  );
+  if (sysTaskResult != pdPASS) {
+    Serial.println("ERROR: Failed to create SystemTask on Core 0");
+  }
+
   // --- REQUIREMENTS-COMPLIANT SETUP COMPLETE ---
   Serial.println("System ready:");
-  Serial.println("- Core 1: Hardware timer ISR for PID control (100ms)");
-  Serial.println("- Core 0: Main loop with millis() timing for non-critical operations");
+  Serial.println("- Core 1: ControlTask for PID control (100ms)");
+  Serial.println("- Core 0: SystemTask with millis() timing for non-critical operations");
 }
 
 // --- Core Loop Functions ---
@@ -3602,202 +1881,45 @@ void handleSerialCommands() {
   }
 }
 
-void loop() {
-  // --- REQUIREMENTS-COMPLIANT ARCHITECTURE ---
-  // Core 1: Hardware timer ISR handles PID control every 100ms
-  // Core 0: Main loop handles Web UI, OLED updates, non-critical sensors using millis() timing
+// --- Core 0 SystemTask ---
+// Explicitly pinned (see setup()) instead of relying on the Arduino
+// framework's default placement for its own loop() task. Everything here
+// was previously the body of loop() — same functions, same order, same
+// millis()-based timing; only the task that runs it is now explicit.
+// (systemTaskHandle is declared near the top of the file, alongside the
+// other task handles, since setup() references it before this point.)
+void systemTask(void* parameter) {
+  Serial.printf("SystemTask started on core %d\n", xPortGetCoreID());
 
-  handleNetworkCommunication();  // Network: Web server and WebSocket handling
+  for (;;) {
+    handleNetworkCommunication();  // Network: Web server and WebSocket handling
 #ifndef BENCH_MODE
-  handlePIDUpdates();            // Critical: PID control and temperature reading
-  handleSystemMonitoring();      // Safety: Error monitoring and watchdog
-  updateStateMachine();          // Control: State machine updates
-  handleSensorReadings();        // Sensors: Scale and pressure readings
-  handleUserInterface();         // Display: OLED updates
-  handleSystemOperations();      // Operations: Fill, brew switch, calibration
-  handleBrewPhaseManagement();   // Brew: Shot timing and phase control
+    handlePIDUpdates();            // Critical: temperature reading + caching for ControlTask
+    handleSystemMonitoring();      // Safety: Error monitoring and watchdog
+    updateStateMachine();          // Control: State machine updates
+    handleSensorReadings();        // Sensors: Scale and pressure readings
+    handleUserInterface();         // Display: OLED updates
+    handleSystemOperations();      // Operations: Fill, brew switch, calibration
+    handleBrewPhaseManagement();   // Brew: Shot timing and phase control
 #endif
-  handleSerialCommands();        // Debug: Serial command processing
-}
+    handleSerialCommands();        // Debug: Serial command processing
 
-// --- Pressure Measurement Functions ---
-void initPressure() {
-  // Initialize pressure transducer pin
-  pinMode(PIN_PRESSURE, INPUT);
-
-  // Pressure calibration values (pressureOffset, pressureScale) are loaded from EEPROM
-  // in loadParametersFromEEPROM() during initEEPROM() call in setup()
-
-  Serial.println("Pressure measurement system initialized");
-}
-
-double readPressure() {
-  // Read analog value from pressure transducer
-  int rawValue = analogRead(PIN_PRESSURE);
-
-  // Convert to voltage (0-3.3V range) - Direct connection, no voltage divider
-  double voltage = (rawValue * ADC_MAX_VOLTAGE) / ADC_RESOLUTION;
-
-  // Convert voltage to pressure using calibration
-  double pressure = (voltage - pressureOffset) * pressureScale;
-
-  // Apply exponential moving average smoothing
-  if (pressureFirstReading) {
-    filteredPressure = pressure;
-    pressureFirstReading = false;
-  } else {
-    filteredPressure = pressureAlpha * pressure + (1.0 - pressureAlpha) * filteredPressure;
-  }
-
-  // Update current pressure
-  currentPressure = filteredPressure;
-
-  // Pressure safety check with hysteresis (prevents pump oscillation)
-  if (!pressureLockoutActive && currentPressure >= PRESSURE_LOCKOUT_HIGH) {
-    // Enter pressure lockout state
-    pressureLockoutActive = true;
-    setError(ERR_FLAG_PRESSURE);
-    Serial.printf("PRESSURE SAFETY: %.1f BAR exceeds %.1f BAR limit - entering lockout\n", currentPressure, PRESSURE_LOCKOUT_HIGH);
-    
-    // Stop brew cycle if active
-    if (currentState == STATE_BREW_ACTIVE || currentState == STATE_BREW_START) {
-      Serial.println("PRESSURE SAFETY: Stopping brew cycle");
-      set_pump(false);
-      set_brew_solenoid(false);
-      changeState(STATE_BREW_END);
-    }
-  } else if (pressureLockoutActive && currentPressure <= PRESSURE_LOCKOUT_LOW) {
-    // Exit pressure lockout state (hysteresis)
-    pressureLockoutActive = false;
-    clearError(ERR_FLAG_PRESSURE);
-    Serial.printf("PRESSURE SAFETY: %.1f BAR below %.1f BAR - exiting lockout\n", currentPressure, PRESSURE_LOCKOUT_LOW);
-  }
-
-  return currentPressure;
-}
-
-void startPressureCalibration() {
-  if (currentState != STATE_IDLE) {
-    Serial.println("Cannot start pressure calibration - system not in IDLE state");
-    return;
-  }
-
-  if (isPressureCal()) {
-    Serial.println("Pressure calibration already in progress");
-    return;
-  }
-
-  // Start pressure calibration mode
-  calStep = CAL_PRESSURE_ZERO;
-  pressureCalComplete = false;
-  recomputeSetupComplete();
-  eepromDirty = true;
-
-  // Reset accumulators to prevent stale values from previous calibration attempts
-  pressureZeroReading = 0;
-  pressureHighReading = 0;
-
-  Serial.println("Pressure calibration started - ensure system is at ZERO pressure");
-  Serial.println("FILL and BREW operations are now locked out");
-  Serial.println("Press button when ready to calibrate ZERO point");
-}
-
-void processPressureCalibrationStep() {
-  if (!isPressureCal()) return;
-
-  // Collect all 4 oversamples in one call (called only from web handler, not main loop)
-  const int OVERSAMPLE_COUNT = 4;
-  const unsigned long SAMPLE_DELAY_MS = 10;
-
-  if (calStep == CAL_PRESSURE_ZERO) {
-    // Sample zero pressure reading with oversampling
-    pressureZeroReading = 0;
-    for (int i = 0; i < OVERSAMPLE_COUNT; i++) {
-      pressureZeroReading += analogRead(PIN_PRESSURE);
-      if (i < OVERSAMPLE_COUNT - 1) delay(SAMPLE_DELAY_MS);  // 10ms between samples, 30ms total
-    }
-    pressureZeroReading /= OVERSAMPLE_COUNT;
-    Serial.printf("Zero pressure reading: %d\n", pressureZeroReading);
-
-    // Move to high pressure calibration
-    calStep = CAL_PRESSURE_HIGH;
-    Serial.printf("Now use Web UI 'Start Pump (Cal)' button and set actual pressure to %.1f BAR\n", pressureHighValue);
-    Serial.println("Use 'Set Pressure Value' to confirm reading, then 'Next Pressure Step' to complete");
-
-  } else if (calStep == CAL_PRESSURE_HIGH) {
-    // Sample high pressure reading with oversampling
-    pressureHighReading = 0;
-    for (int i = 0; i < OVERSAMPLE_COUNT; i++) {
-      pressureHighReading += analogRead(PIN_PRESSURE);
-      if (i < OVERSAMPLE_COUNT - 1) delay(SAMPLE_DELAY_MS);
-    }
-    pressureHighReading /= OVERSAMPLE_COUNT;
-    Serial.printf("High pressure reading: %d\n", pressureHighReading);
-
-    // Calculate calibration values
-    completePressureCalibration();
+    // Yield to the scheduler/idle task each cycle — same effect as the small
+    // implicit yield the Arduino loopTask gets between loop() calls.
+    vTaskDelay(1);
   }
 }
 
-void completePressureCalibration() {
-  // Minimum voltage range for valid calibration (prevents divide-by-zero and noise issues)
-  const double MIN_CAL_VOLTAGE_RANGE = 0.5;  // 0.5V minimum range required
-  
-  // Convert ADC counts to voltages for consistent unit handling
-  double zeroVoltage = (pressureZeroReading * ADC_MAX_VOLTAGE) / ADC_RESOLUTION;
-  double highVoltage = (pressureHighReading * ADC_MAX_VOLTAGE) / ADC_RESOLUTION;
-  double voltageRange = highVoltage - zeroVoltage;
-
-  // Validate calibration (minimum voltage range for reliable calibration)
-  if (voltageRange > MIN_CAL_VOLTAGE_RANGE) {
-    // Calculate voltage per bar (now in proper voltage units)
-    double voltagePerBar = voltageRange / pressureHighValue;
-
-    // Set calibration values (all in voltage units for consistency with readPressure())
-    pressureOffset = zeroVoltage;  // Store as voltage, not ADC counts
-    pressureScale = 1.0 / voltagePerBar;  // BAR per volt
-
-    Serial.printf("Pressure calibration completed:\n");
-    Serial.printf("  Zero reading: %d (%.3fV)\n", pressureZeroReading, zeroVoltage);
-    Serial.printf("  High reading: %d (%.3fV)\n", pressureHighReading, highVoltage);
-    Serial.printf("  Voltage range: %.3fV\n", voltageRange);
-    Serial.printf("  Offset: %.3fV\n", pressureOffset);
-    Serial.printf("  Scale: %.3f BAR/V\n", pressureScale);
-
-    // Mark pressure calibration as complete
-    pressureCalComplete = true;
-
-    // Update setupComplete if all required calibrations are done
-    recomputeSetupComplete();
-
-    eepromDirty = true;
-
-    // Stop pump and exit calibration mode
-    set_pump(false);
-    calStep = CAL_IDLE;
-
-    Serial.println("Pressure calibration completed successfully - pump stopped");
-    Serial.println("FILL and BREW operations are now unlocked");
-    if (setupComplete) {
-      Serial.println("All required calibrations complete - PID enabled");
-    }
-
-  } else {
-    // Calibration failed - insufficient voltage range
-    Serial.println("ERROR: Pressure calibration failed - insufficient voltage range");
-    Serial.printf("Voltage range: %.3fV (minimum required: %.1fV)\n",
-                  voltageRange, MIN_CAL_VOLTAGE_RANGE);
-    Serial.println("Check pressure transducer wiring and ensure proper pressure range");
-
-    // Keep previous calibration values
-    Serial.println("Previous calibration values retained");
-
-    // Stop pump and exit calibration mode
-    set_pump(false);
-    calStep = CAL_IDLE;
-    Serial.println("FILL and BREW operations are now unlocked");
-  }
+// Arduino's own setup()/loop() task is no longer where the steady-state
+// workload runs (see systemTask above) — loop() is intentionally inert.
+void loop() {
+  vTaskDelay(portMAX_DELAY);
 }
+
+// initPressure()/readPressure() now live in sensors.cpp.
+
+// startPressureCalibration()/processPressureCalibrationStep()/
+// completePressureCalibration() now live in calibration.cpp.
 
 /*
 ================================================================================
