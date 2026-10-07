@@ -145,22 +145,16 @@ NOTE: Fully requirements-compliant production firmware per specification documen
 #include <EEPROM.h>
 #include <Adafruit_MAX31865.h>
 #include <esp_task_wdt.h>
-#include <esp_timer.h>
 #include <atomic>
+#include "config.h"
+#include "error_system.h"
+#include "shared_state.h"
 
-// --- Pin Configuration ---
-// Pins must be defined before hardware objects that use them
-const int PIN_TEMP_CS = 21;     // SPI CS for thermocouple/MAX31865 (D10/GPIO21)
-const int PIN_FILL_PROBE = 2;   // Fill level probe (A1/GPIO2 - analog input)
-const int PIN_BREW_SWITCH = 3;  // Brew momentary switch (A2/GPIO3 - NO contact to GND)
-                                // Momentary operation: Press to start brew, press again to stop brew
-                                // Rising edge detection with debounce and double-press protection
-
-// 4-Channel Relay Control (3.3V trigger, 12V coil, switches 10A @ 120VAC)
-const int PIN_RELAY_CH1 = 8;   // Ch1: Brew Solenoid (D5/GPIO8)
-const int PIN_RELAY_CH2 = 9;   // Ch2: Pump (D6/GPIO9)
-const int PIN_RELAY_CH3 = 10;  // Ch3: Fill Solenoid (D7/GPIO10)
-const int PIN_RELAY_CH4 = 17;  // Ch4: Boiler Element SSR (D8/GPIO17)
+// Pin assignments, EEPROM map, and cross-cutting safety constants now live in
+// config.h. PID gains, setpoint, boost/pre-infusion flags, allowUnsafePid,
+// filtered temp, PID output percent, boiler-heating state, and cached raw
+// temp now live in shared_state.h/.cpp (accessed via getters/setters only).
+// Error flags and systemMessage now live in error_system.h/.cpp.
 
 // --- Hardware Objects ---
 // OLED Display - SH1107 128x128 I2C (Arduino Nano ESP32: A4=SDA/GPIO11, A5=SCL/GPIO12)
@@ -172,38 +166,12 @@ Adafruit_NAU7802 nau;
 // MAX31865 PT100 RTD sensor
 Adafruit_MAX31865 rtdSensor = Adafruit_MAX31865(PIN_TEMP_CS);
 
-// RTD configuration constants
-const float RREF = 430.0;      // Reference resistor value (typically 430 ohms for PT100)
-const float RNOMINAL = 100.0;  // PT100 nominal resistance at 0°C (100 ohms)
-
 // Control parameters (all temperatures in Fahrenheit)
-volatile double setpointTemp = 200.0;  // Fahrenheit, brew temp default (200°F)
+// setpointTemp, Kp/Ki/Kd now live in shared_state.cpp — use
+// getSetpointTemp()/setSetpointTemp(), getKp()/setKp(), etc.
 double originalSetpointTemp = 200.0;   // Store original setpoint for predictive compensation
-const double safetyTemp = 225.0;       // Fahrenheit, emergency cutoff (225°F, 5°F margin above max setpoint)
-const double minTemp = 32.0;           // Fahrenheit, minimum reading (32°F = 0°C)
 
 const double tempCompensation = 2.0;  // Fahrenheit, predictive compensation for cold water inrush
-
-// Pressure safety thresholds (BAR) with hysteresis to prevent pump oscillation
-const double PRESSURE_LOCKOUT_HIGH = 12.0;  // Enter lockout when pressure reaches this level
-const double PRESSURE_LOCKOUT_LOW = 11.0;   // Exit lockout when pressure drops to this level
-
-// PID parameters (simple PID)
-double Kp = 40.0;
-double Ki = 0.8;
-double Kd = 120.0;
-const double integralMax = 1000.0;  // PID integral windup protection limit
-
-// Temperature filtering constant
-// Alpha = 0.1 provides light filtering with ~10 sample effective window at 100ms intervals
-// This balances noise reduction with responsiveness for PID control
-// Lower alpha (0.05): More smoothing but slower response to actual temp changes
-// Higher alpha (0.3): Faster response but more noise passes through
-const double TEMP_FILTER_ALPHA = 0.1;  // Optimized for PT100 RTD with low inherent noise
-
-// Loop timing
-const unsigned long CONTROL_INTERVAL_MS = 100;       // PID interval (100ms)
-const unsigned long PID_TIMER_INTERVAL_US = 100000;  // 100ms in microseconds for hardware timer
 
 // Wi-Fi (stub)
 const char* ssid = "espresso_AP";
@@ -219,35 +187,7 @@ const unsigned long WEB_RATE_LIMIT = 50;  // 50ms between requests
 unsigned long lastWebSocketBroadcast = 0;
 const unsigned long WEBSOCKET_BROADCAST_INTERVAL = 100;  // 100ms WebSocket updates
 
-// --- EEPROM Storage Structure ---
-const uint16_t EEPROM_SIGNATURE = 0xABCD;
-const int EEPROM_SIZE = 512;  // Total EEPROM size
-
-// EEPROM Memory Map (per requirements document + PID gains)
-const int ADDR_SIGNATURE = 0;               // 0-1: Signature 0xABCD (2 bytes)
-const int ADDR_BREW_TEMP = 2;               // 2-5: Brew Temp (°F) (4 bytes)
-const int ADDR_SHOT_TIME = 6;               // 6-9: Shot Time (s) (4 bytes)
-const int ADDR_SHOT_WEIGHT = 10;            // 10-13: Shot Weight (g) (4 bytes)
-const int ADDR_PREINFUSION = 14;            // 14-17: Pre-infusion Time (s) (4 bytes)
-const int ADDR_SCALE_CAL = 18;              // 18-21: Scale Calibration Factor (4 bytes)
-const int ADDR_PID_BOOST = 22;              // 22-25: PID Boost (s) (4 bytes)
-const int ADDR_PID_KP = 26;                 // 26-29: PID Kp gain (4 bytes)
-const int ADDR_PID_KI = 30;                 // 30-33: PID Ki gain (4 bytes)
-const int ADDR_PID_KD = 34;                 // 34-37: PID Kd gain (4 bytes)
-const int ADDR_FILL_THRESHOLD = 38;         // 38-41: Fill Probe Threshold (4 bytes)
-const int ADDR_PREINFUSION_RATE = 42;       // 42-45: Pre-infusion Pulse Rate (ms) (4 bytes)
-const int ADDR_PRESSURE_OFFSET = 46;        // 46-49: Pressure Calibration Offset (4 bytes)
-const int ADDR_PRESSURE_SCALE = 50;         // 50-53: Pressure Calibration Scale (4 bytes)
-const int ADDR_DOSE_WEIGHT = 54;            // 54-57: Dose Weight (g) (4 bytes)
-const int ADDR_SCALE_ZERO_OFFSET = 58;      // 58-61: Scale Zero Offset for NAU7802 (4 bytes)
-const int ADDR_SETUP_COMPLETE = 62;         // 62: Setup Complete flag (1 byte)
-const int ADDR_TEMP_CAL_COMPLETE = 63;      // 63: Temperature Calibration Complete (1 byte)
-const int ADDR_PRESSURE_CAL_COMPLETE = 64;  // 64: Pressure Calibration Complete (1 byte)
-const int ADDR_BOILER_FILLED = 65;          // 65: Boiler Filled at least once (1 byte)
-const int ADDR_ALLOW_UNSAFE_PID = 66;       // 66: Allow PID bypass during setup (1 byte)
-const int ADDR_SCALE_CAL_COMPLETE = 67;     // 67: Scale Calibration Complete (1 byte)
-const int ADDR_CLEANING_CYCLES = 68;       // 68-71: Cleaning Cycle Count (4 bytes, int)
-// Total EEPROM: 72 bytes (addresses 0-71)
+// EEPROM signature, size, and ADDR_* memory map now live in config.h.
 
 // --- State Machine ---
 enum SystemState {
@@ -271,32 +211,30 @@ bool pressureCalComplete = false;  // Pressure transducer calibration complete (
 bool boilerFilled = false;         // Steam boiler has been filled (tracked independently, not required for PID)
 bool scaleCalComplete = false;     // Scale calibration complete (optional - system uses shot time target if scale unavailable)
 bool fillCalComplete = false;      // Fill probe calibration complete (optional, non-blocking)
-bool allowUnsafePid = false;       // Allow PID to run before setup completes (requires explicit opt-in)
+// allowUnsafePid now lives in shared_state.cpp (getAllowUnsafePid()/setAllowUnsafePid()).
 
 // Shot parameters and targets
 double shotTargetWeight = 36.0;   // grams, default target weight
 double shotTargetTime = 30.0;     // seconds, default target time
-const double maxBrewTime = 60.0;  // seconds, maximum brew timeout
 unsigned long brewStartTime = 0;  // milliseconds when brew started
 
 // PID Boost and Pre-infusion parameters
+// pidBoostActive and preInfusionPhase now live in shared_state.cpp
+// (getPidBoostActive()/setPidBoostActive(), getPreInfusionPhase()/setPreInfusionPhase()).
 double pidBoostDuration = 4.0;      // seconds, default PID boost duration
 double preInfusionDuration = 8.0;   // seconds, default pre-infusion duration
 double preInfusionPulseRate = 500;  // milliseconds, configurable pulse on/off duration
-bool pidBoostActive = false;
-bool preInfusionPhase = false;
 unsigned long pidBoostStartTime = 0;
 unsigned long preInfusionStartTime = 0;
 
-// State (temperatures in Fahrenheit)
-double currentTemp = 77.0;             // Start at room temp ~77°F - filtered value for display/control
-volatile double cachedRawTemp = 77.0;  // Raw temp cached by main loop for PID task (avoids SPI from Core 1)
-double pidOutput = 0.0;                // 0.0 - 1.0
+// currentTemp and cachedRawTemp now live in shared_state.cpp
+// (getTemp()/setTemp(), getCachedRawTemp()/setCachedRawTemp()).
+double pidOutput = 0.0;  // 0.0 - 1.0, Core 1 (PID task) internal scratch value
 
 // Temperature rate-of-change protection (unified limit for sensor and PID)
+// MAX_TEMP_RATE now lives in config.h.
 double lastTemp = 77.0;
 unsigned long lastTempTime = 0;
-const double MAX_TEMP_RATE = 5.0;  // Maximum °F per second (safety limit - unified for sensor and PID)
 
 // Display variables
 double shotTime = 0.0;
@@ -305,41 +243,12 @@ bool scaleConnected = false;
 float scaleValidationWeight = 0.0;           // Last weight for stability validation
 unsigned long scaleValidationStartTime = 0;  // When validation started
 int scaleValidationCount = 0;                // Consecutive stable readings
-bool boilerHeating = false;
+// boilerHeating and preInfusionActive now live in shared_state.cpp
+// (getBoilerHeatingState()/setBoilerHeatingState(), getPreInfusionActive()/
+// setPreInfusionActive()). systemMessage and the error-flag bus now live in
+// error_system.h/.cpp.
 bool brewActive = false;
 bool fillActive = false;
-bool preInfusionActive = false;
-String systemMessage = "";  // System messages for display (e.g., "SCALE ERR", "TEMP ERR")
-
-// Atomic error flags — lock-free on ESP32 (8-bit), no mutex needed
-// Set/cleared from Core 0 (main loop), read from Core 1 (PID task)
-std::atomic<uint8_t> errorFlags(0);
-#define ERR_FLAG_TEMP (1 << 0)      // Over-temperature error
-#define ERR_FLAG_RTD (1 << 1)       // RTD sensor fault
-#define ERR_FLAG_PID (1 << 2)       // PID control failure
-#define ERR_FLAG_SCALE (1 << 3)     // Scale disconnected
-#define ERR_FLAG_PRESSURE (1 << 4)  // Over-pressure error
-#define ERR_FLAG_DISPLAY (1 << 5)   // Display initialization failed
-#define ERR_FLAG_I2C (1 << 6)       // I2C communication failed
-#define ERR_FLAG_LOOP_TIMEOUT (1 << 7)  // Main loop timeout
-
-inline uint8_t getErrorFlags() {
-  return errorFlags.load(std::memory_order_acquire);
-}
-inline void setErrorFlag(uint8_t flag) {
-  errorFlags.fetch_or(flag, std::memory_order_release);
-}
-inline void clearErrorFlag(uint8_t flag) {
-  errorFlags.fetch_and(~flag, std::memory_order_release);
-}
-
-// Thread-safe error flag helpers for PID task
-inline bool hasErrorFlag(uint8_t flag) {
-  return (getErrorFlags() & flag) != 0;
-}
-inline bool hasCriticalErrorFlag() {
-  return (getErrorFlags() & (ERR_FLAG_TEMP | ERR_FLAG_RTD | ERR_FLAG_PID)) != 0;
-}
 
 // Flow rate calculation variables
 double currentFlowRate = 0.0;  // ml/s extraction rate
@@ -365,8 +274,7 @@ bool scaleStabilityReset = false;  // Flag to reset stability on brew start
 // If scale becomes unreliable at ANY point during shot, brew stops by time instead of weight
 bool scaleReliableEntireShot = true;  // Reset to true at brew start, set false if scale fails
 
-// PID output tracking variables
-double currentPIDOutputPercent = 0.0;  // PID output as percentage (0-100%)
+// PID output tracking: currentPIDOutputPercent now lives in shared_state.cpp.
 
 // Cleaning cycle variables
 bool cleaningActive = false;
@@ -502,14 +410,8 @@ volatile bool eepromDirty = false;
 // State change mutex - protects currentState from race conditions
 portMUX_TYPE stateMux = portMUX_INITIALIZER_UNLOCKED;
 
-// Control mutex - protects shared control variables accessed by PID task
-portMUX_TYPE controlMux = portMUX_INITIALIZER_UNLOCKED;
-
-// Temperature mutex - protects currentTemp from race conditions between PID task and main loop
-portMUX_TYPE tempMux = portMUX_INITIALIZER_UNLOCKED;
-
-// Cached temperature mutex - protects cachedRawTemp for main loop -> PID task communication
-portMUX_TYPE cachedTempMux = portMUX_INITIALIZER_UNLOCKED;
+// controlMux, tempMux, and cachedTempMux now live inside shared_state.cpp
+// as inputsMux/outputsMux/cachedTempMux (private to that file).
 
 // FreeRTOS variables removed - using simple millis() timing per requirements
 
@@ -668,80 +570,13 @@ void recomputeSetupComplete() {
   setupComplete = (tempCalComplete && pressureCalComplete);
 }
 
-bool getAllowUnsafePid() {
-  portENTER_CRITICAL(&controlMux);
-  bool allowed = allowUnsafePid;
-  portEXIT_CRITICAL(&controlMux);
-  return allowed;
-}
-
-void setAllowUnsafePid(bool allowed) {
-  portENTER_CRITICAL(&controlMux);
-  allowUnsafePid = allowed;
-  portEXIT_CRITICAL(&controlMux);
-}
+// getAllowUnsafePid/setAllowUnsafePid, getSetpointTemp/setSetpointTemp/
+// addSetpointTemp, getPidBoostActive/setPidBoostActive, getPreInfusionPhase/
+// getPreInfusionActive, getCurrentPIDOutputPercent/setCurrentPIDOutputPercent
+// now live in shared_state.cpp.
 
 bool isPidAllowed() {
   return setupComplete || getAllowUnsafePid();
-}
-
-double getSetpointTemp() {
-  portENTER_CRITICAL(&controlMux);
-  double temp = setpointTemp;
-  portEXIT_CRITICAL(&controlMux);
-  return temp;
-}
-
-bool getPidBoostActive() {
-  portENTER_CRITICAL(&controlMux);
-  bool active = pidBoostActive;
-  portEXIT_CRITICAL(&controlMux);
-  return active;
-}
-
-void setPidBoostActive(bool active) {
-  portENTER_CRITICAL(&controlMux);
-  pidBoostActive = active;
-  portEXIT_CRITICAL(&controlMux);
-}
-
-bool getPreInfusionPhase() {
-  portENTER_CRITICAL(&controlMux);
-  bool phase = preInfusionPhase;
-  portEXIT_CRITICAL(&controlMux);
-  return phase;
-}
-
-bool getPreInfusionActive() {
-  portENTER_CRITICAL(&controlMux);
-  bool active = preInfusionActive;
-  portEXIT_CRITICAL(&controlMux);
-  return active;
-}
-
-void setSetpointTemp(double temp) {
-  portENTER_CRITICAL(&controlMux);
-  setpointTemp = temp;
-  portEXIT_CRITICAL(&controlMux);
-}
-
-void addSetpointTemp(double delta) {
-  portENTER_CRITICAL(&controlMux);
-  setpointTemp += delta;
-  portEXIT_CRITICAL(&controlMux);
-}
-
-double getCurrentPIDOutputPercent() {
-  portENTER_CRITICAL(&controlMux);
-  double percent = currentPIDOutputPercent;
-  portEXIT_CRITICAL(&controlMux);
-  return percent;
-}
-
-void setCurrentPIDOutputPercent(double percent) {
-  portENTER_CRITICAL(&controlMux);
-  currentPIDOutputPercent = percent;
-  portEXIT_CRITICAL(&controlMux);
 }
 
 // --- NAU7802 Scale Functions ---
@@ -1141,21 +976,24 @@ void updateDisplay() {
   }
 
   // Only update boiler heating icon if changed
-  if (boilerHeating != lastDisplayedBoilerHeating) {
+  bool boilerHeatingNow = getBoilerHeatingState();
+  if (boilerHeatingNow != lastDisplayedBoilerHeating) {
     u8g2.setDrawColor(0);  // Clear area
     u8g2.drawBox(90, 38, 35, 10);
     u8g2.setDrawColor(1);  // Draw text
-    if (boilerHeating) {
+    if (boilerHeatingNow) {
       u8g2.drawStr(90, 45, "HEAT");
     }
-    lastDisplayedBoilerHeating = boilerHeating;
+    lastDisplayedBoilerHeating = boilerHeatingNow;
     needsUpdate = true;
   }
 
   // Only update status icons if changed
   static bool lastDisplayedPidBoostActive = false;
-  if (brewActive != lastDisplayedBrewActive || fillActive != lastDisplayedFillActive || 
-      preInfusionActive != lastDisplayedPreInfusionActive || pidBoostActive != lastDisplayedPidBoostActive) {
+  bool preInfusionActiveNow = getPreInfusionActive();
+  bool pidBoostActiveNow = getPidBoostActive();
+  if (brewActive != lastDisplayedBrewActive || fillActive != lastDisplayedFillActive ||
+      preInfusionActiveNow != lastDisplayedPreInfusionActive || pidBoostActiveNow != lastDisplayedPidBoostActive) {
     u8g2.setDrawColor(0);  // Clear status line
     u8g2.drawBox(5, 53, 120, 10);
     u8g2.setDrawColor(1);  // Draw icons
@@ -1165,16 +1003,16 @@ void updateDisplay() {
     if (fillActive) {
       u8g2.drawStr(35, 60, "FILL");
     }
-    if (preInfusionActive) {
+    if (preInfusionActiveNow) {
       u8g2.drawStr(60, 60, "PRE");
     }
-    if (pidBoostActive) {
+    if (pidBoostActiveNow) {
       u8g2.drawStr(90, 60, "BOOST");
     }
     lastDisplayedBrewActive = brewActive;
     lastDisplayedFillActive = fillActive;
-    lastDisplayedPreInfusionActive = preInfusionActive;
-    lastDisplayedPidBoostActive = pidBoostActive;
+    lastDisplayedPreInfusionActive = preInfusionActiveNow;
+    lastDisplayedPidBoostActive = pidBoostActiveNow;
     needsUpdate = true;
   }
 
@@ -1431,12 +1269,10 @@ void emergencyStop() {
   fillInProgress = false;
   portEXIT_CRITICAL(&stateMux);
   
-  // Second: Stop control variables (controlMux protected, avoid nesting)
-  setPidBoostActive(false);  // This function handles its own controlMux
-  portENTER_CRITICAL(&controlMux);
-  preInfusionActive = false;
-  preInfusionPhase = false;
-  portEXIT_CRITICAL(&controlMux);
+  // Second: Stop control variables (each setter takes its own lock, avoid nesting)
+  setPidBoostActive(false);
+  setPreInfusionActive(false);
+  setPreInfusionPhase(false);
 
   // Critical errors require ERROR state and manual reboot
   if (requiresManualReboot()) {
@@ -1690,10 +1526,10 @@ void set_boiler_element(bool on) {
 #ifdef BENCH_MODE
   // Bench mode: block heater relay, keep it OFF regardless of PID request
   digitalWrite(PIN_RELAY_CH4, LOW);
-  boilerHeating = false;
+  setBoilerHeatingState(false);
 #else
   digitalWrite(PIN_RELAY_CH4, on ? HIGH : LOW);
-  boilerHeating = on;
+  setBoilerHeatingState(on);
 #endif
 }
 
@@ -1907,35 +1743,7 @@ SystemState getState() {
   return state;
 }
 
-// Thread-safe temperature getter for use from main loop
-double getTemp() {
-  portENTER_CRITICAL(&tempMux);
-  double temp = currentTemp;
-  portEXIT_CRITICAL(&tempMux);
-  return temp;
-}
-
-// Thread-safe temperature setter for use from PID task
-void setTemp(double temp) {
-  portENTER_CRITICAL(&tempMux);
-  currentTemp = temp;
-  portEXIT_CRITICAL(&tempMux);
-}
-
-// Thread-safe cached raw temperature getter for PID task (avoids SPI access from Core 1)
-double getCachedRawTemp() {
-  portENTER_CRITICAL(&cachedTempMux);
-  double temp = cachedRawTemp;
-  portEXIT_CRITICAL(&cachedTempMux);
-  return temp;
-}
-
-// Thread-safe cached raw temperature setter for main loop
-void setCachedRawTemp(double temp) {
-  portENTER_CRITICAL(&cachedTempMux);
-  cachedRawTemp = temp;
-  portEXIT_CRITICAL(&cachedTempMux);
-}
+// getTemp/setTemp and getCachedRawTemp/setCachedRawTemp now live in shared_state.cpp.
 
 const char* getStateName(SystemState state) {
   static char cleaningStateBuffer[20];
@@ -2199,11 +2007,8 @@ void startBrewRoutine() {
   // Initialize PID Boost and Pre-infusion phases
   setPidBoostActive(true);
   pidBoostStartTime = millis();
-  // Pre-infusion variables need controlMux protection for thread safety
-  portENTER_CRITICAL(&controlMux);
-  preInfusionPhase = true;
-  preInfusionActive = true;
-  portEXIT_CRITICAL(&controlMux);
+  setPreInfusionPhase(true);
+  setPreInfusionActive(true);
   preInfusionStartTime = millis();
 
   // Reset PID integral at brew start to prevent windup carryover between brew cycles
@@ -2243,11 +2048,8 @@ void stopBrewRoutine() {
 
   // Stop all brew phases
   setPidBoostActive(false);
-  // Pre-infusion variables need controlMux protection for thread safety
-  portENTER_CRITICAL(&controlMux);
-  preInfusionPhase = false;
-  preInfusionActive = false;
-  portEXIT_CRITICAL(&controlMux);
+  setPreInfusionPhase(false);
+  setPreInfusionActive(false);
 
   // Stop pump and close brew solenoid
   set_pump(false);
@@ -2612,6 +2414,13 @@ void pid_step() {
 
   double error = getSetpointTemp() - filteredTemp;
 
+  // Snapshot gains before the pidMux critical section — avoids nesting the
+  // inputsMux (inside getKp/getKi/getKd) inside pidMux, same pattern already
+  // used elsewhere in this file for mutex-protected values.
+  double snapKp = getKp();
+  double snapKi = getKi();
+  double snapKd = getKd();
+
   portENTER_CRITICAL(&pidMux);
   pid_integral += error * (CONTROL_INTERVAL_MS / 1000.0);
 
@@ -2623,7 +2432,7 @@ void pid_step() {
   // Negative sign because we're measuring temperature change, not error change
   // Uses prevPidTemp (stored before update) to get actual temperature rate of change
   double derivative = -(filteredTemp - prevPidTemp) / (CONTROL_INTERVAL_MS / 1000.0);
-  pidOutput = Kp * error + Ki * pid_integral + Kd * derivative;
+  pidOutput = snapKp * error + snapKi * pid_integral + snapKd * derivative;
   // Note: pid_prev_error kept for potential future use, but derivative now uses measurement
   pid_prev_error = error;
   portEXIT_CRITICAL(&pidMux);
@@ -2733,6 +2542,9 @@ void saveParametersToEEPROM() {
   // This avoids nested critical sections (S-3) and keeps flash writes outside spinlocks (S-2)
   double snapSetpointTemp = getSetpointTemp();
   bool snapAllowUnsafePid = getAllowUnsafePid();
+  double snapKp = getKp();
+  double snapKi = getKi();
+  double snapKd = getKd();
 
   // Write signature
   writeUint16ToEEPROM(ADDR_SIGNATURE, EEPROM_SIGNATURE);
@@ -2744,9 +2556,9 @@ void saveParametersToEEPROM() {
   writeFloatToEEPROM(ADDR_PREINFUSION, preInfusionDuration);
   writeFloatToEEPROM(ADDR_SCALE_CAL, scaleCalibrationFactor);
   writeFloatToEEPROM(ADDR_PID_BOOST, pidBoostDuration);
-  writeFloatToEEPROM(ADDR_PID_KP, Kp);
-  writeFloatToEEPROM(ADDR_PID_KI, Ki);
-  writeFloatToEEPROM(ADDR_PID_KD, Kd);
+  writeFloatToEEPROM(ADDR_PID_KP, snapKp);
+  writeFloatToEEPROM(ADDR_PID_KI, snapKi);
+  writeFloatToEEPROM(ADDR_PID_KD, snapKd);
   EEPROM.put(ADDR_FILL_THRESHOLD, fillProbeThreshold);
   writeFloatToEEPROM(ADDR_PREINFUSION_RATE, preInfusionPulseRate);
   writeFloatToEEPROM(ADDR_PRESSURE_OFFSET, pressureOffset);
@@ -2794,9 +2606,9 @@ bool loadParametersFromEEPROM() {
   preInfusionDuration = readFloatFromEEPROM(ADDR_PREINFUSION);
   scaleCalibrationFactor = readFloatFromEEPROM(ADDR_SCALE_CAL);
   pidBoostDuration = readFloatFromEEPROM(ADDR_PID_BOOST);
-  Kp = readFloatFromEEPROM(ADDR_PID_KP);
-  Ki = readFloatFromEEPROM(ADDR_PID_KI);
-  Kd = readFloatFromEEPROM(ADDR_PID_KD);
+  setKp(readFloatFromEEPROM(ADDR_PID_KP));
+  setKi(readFloatFromEEPROM(ADDR_PID_KI));
+  setKd(readFloatFromEEPROM(ADDR_PID_KD));
   EEPROM.get(ADDR_FILL_THRESHOLD, fillProbeThreshold);
   preInfusionPulseRate = readFloatFromEEPROM(ADDR_PREINFUSION_RATE);
   pressureOffset = readFloatFromEEPROM(ADDR_PRESSURE_OFFSET);
@@ -2826,9 +2638,9 @@ bool loadParametersFromEEPROM() {
   if (preInfusionDuration < 0 || preInfusionDuration > shotTargetTime) preInfusionDuration = 8.0;
   if (pidBoostDuration < 0 || pidBoostDuration > shotTargetTime) pidBoostDuration = 4.0;
   if (scaleCalibrationFactor < 0.1 || scaleCalibrationFactor > 10.0) scaleCalibrationFactor = 1.0;
-  if (Kp < 0.1 || Kp > 200.0) Kp = 40.0;
-  if (Ki < 0.0 || Ki > 10.0) Ki = 0.8;
-  if (Kd < 0.0 || Kd > 500.0) Kd = 120.0;
+  if (getKp() < 0.1 || getKp() > 200.0) setKp(40.0);
+  if (getKi() < 0.0 || getKi() > 10.0) setKi(0.8);
+  if (getKd() < 0.0 || getKd() > 500.0) setKd(120.0);
   if (fillProbeThreshold < 100 || fillProbeThreshold > 900) fillProbeThreshold = 512;
   if (preInfusionPulseRate < 100 || preInfusionPulseRate > 1000) preInfusionPulseRate = 500;  // 100-1000ms range, user configurable
   if (pressureOffset < -1.0 || pressureOffset > 4.0) pressureOffset = 0.0;  // Voltage units (0-3.3V range)
@@ -2842,7 +2654,7 @@ bool loadParametersFromEEPROM() {
   Serial.printf("Pre-infusion: %.1fs, PID Boost: %.1fs, Scale Cal: %.2f\n",
                 preInfusionDuration, pidBoostDuration, scaleCalibrationFactor);
   Serial.printf("PID Gains: Kp=%.1f, Ki=%.2f, Kd=%.1f, Fill Threshold=%d\n",
-                Kp, Ki, Kd, (int)fillProbeThreshold);
+                getKp(), getKi(), getKd(), (int)fillProbeThreshold);
 
   return true;
 }
@@ -3169,9 +2981,17 @@ void handleSetParams() {
   }
 }
 
+// Kp/Ki/Kd now live behind mutex-protected accessors in shared_state.cpp
+// (not bare globals), so ParamDef takes a setter function pointer instead of
+// a raw double* — this is what actually closes off the ability to write
+// these three gains without going through the lock.
+static void setPidBoostDurationParam(double v) { pidBoostDuration = v; }
+static void setPreInfusionDurationParam(double v) { preInfusionDuration = v; }
+static void setPreInfusionPulseRateParam(double v) { preInfusionPulseRate = v; }
+
 struct ParamDef {
   const char* argName;
-  double* target;
+  void (*setter)(double);
   double min;
   double max;          // 0 means use shotTargetTime as dynamic max
   const char* label;
@@ -3179,12 +2999,12 @@ struct ParamDef {
 };
 
 static const ParamDef pidParams[] = {
-  {"kp",          &Kp,                    0.1,   200.0, "Kp",             "%.1f"},
-  {"ki",          &Ki,                    0.0,   10.0,  "Ki",             "%.2f"},
-  {"kd",          &Kd,                    0.0,   500.0, "Kd",             "%.1f"},
-  {"boost",       &pidBoostDuration,      0.0,   0,     "Boost",          "%.1fs"},
-  {"preinfusion", &preInfusionDuration,   0.0,   0,     "Pre-infusion",   "%.1fs"},
-  {"rate",        &preInfusionPulseRate,  100.0, 1000.0,"Rate",           "%.0fms"},
+  {"kp",          setKp,                      0.1,   200.0, "Kp",             "%.1f"},
+  {"ki",          setKi,                      0.0,   10.0,  "Ki",             "%.2f"},
+  {"kd",          setKd,                      0.0,   500.0, "Kd",             "%.1f"},
+  {"boost",       setPidBoostDurationParam,   0.0,   0,     "Boost",          "%.1fs"},
+  {"preinfusion", setPreInfusionDurationParam, 0.0,  0,     "Pre-infusion",   "%.1fs"},
+  {"rate",        setPreInfusionPulseRateParam, 100.0, 1000.0, "Rate",        "%.0fms"},
 };
 
 void handleSetPIDParameters() {
@@ -3206,7 +3026,7 @@ void handleSetPIDParameters() {
       return;
     }
 
-    *p.target = val;
+    p.setter(val);
     updated = true;
     pos += snprintf(response + pos, sizeof(response) - pos, " %s=", p.label);
     pos += snprintf(response + pos, sizeof(response) - pos, p.fmt, val);
@@ -3304,6 +3124,7 @@ int buildStatusJSON(char* buf, size_t len, bool includeSetup) {
   double snapSetpoint = getSetpointTemp();
   double snapPidOutput = getCurrentPIDOutputPercent();
   bool snapUnsafePid = getAllowUnsafePid();
+  bool snapBoilerHeating = getBoilerHeatingState();
 
   int pos = snprintf(buf, len,
     "{\"currentTemp\":%.1f,\"setpointTemp\":%.1f,\"shotTime\":%.1f,\"shotWeight\":%.1f,"
@@ -3316,7 +3137,7 @@ int buildStatusJSON(char* buf, size_t len, bool includeSetup) {
     doseWeight, snapPidOutput,
     scaleConnected ? "true" : "false",
     brewActive ? "true" : "false",
-    boilerHeating ? "true" : "false",
+    snapBoilerHeating ? "true" : "false",
     getStateName(currentState),
     systemMessage.c_str(), systemMessage.c_str(),
     cleaningActive ? "true" : "false",
@@ -3336,7 +3157,7 @@ int buildStatusJSON(char* buf, size_t len, bool includeSetup) {
       scaleCalComplete ? "true" : "false",
       boilerFilled ? "true" : "false",
       snapSetpoint, shotTargetTime, shotTargetWeight,
-      Kp, Ki, Kd,
+      getKp(), getKi(), getKd(),
       pidBoostDuration, preInfusionDuration, preInfusionPulseRate);
     if (pos < 0 || (size_t)pos >= len) return pos;
   }
@@ -3652,10 +3473,8 @@ void handleBrewPhaseManagement() {
     // Handle pre-infusion timing and pump modulation
     if (getPreInfusionPhase()) {
       if (millisElapsed(preInfusionStartTime, preInfusionDuration * 1000)) {
-        // Pre-infusion phase completion - thread-safe variable update
-        portENTER_CRITICAL(&controlMux);
-        preInfusionPhase = false;
-        portEXIT_CRITICAL(&controlMux);
+        // Pre-infusion phase completion
+        setPreInfusionPhase(false);
         set_pump(true);  // Full pump after pre-infusion
       } else {
         // Configurable pulse during pre-infusion
