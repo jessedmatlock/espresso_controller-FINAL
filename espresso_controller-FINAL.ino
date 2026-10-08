@@ -1884,15 +1884,20 @@ void handleSerialCommands() {
 void mainTask(void* parameter) {
   Serial.printf("MainTask started on core %d\n", xPortGetCoreID());
 
+#ifndef BENCH_MODE
   // Register THIS task with the watchdog — must happen here, not in
   // setup(), because esp_task_wdt_reset() below only feeds the watchdog
   // entry for whichever task calls it. Registering from setup() would
   // register the Arduino main/loop task instead, which never calls reset()
   // again once it falls into the inert loop() below — leaving the real
   // watchdog entry unfed and causing a panic/reboot every LOOP_TIMEOUT.
+  // Guarded by BENCH_MODE to match esp_task_wdt_init() in setup(), which is
+  // also skipped in bench mode — calling add() before init() would just log
+  // a harmless warning, but BENCH_MODE is meant to have no watchdog at all.
   if (esp_task_wdt_add(NULL) != ESP_OK) {
     Serial.println("WARNING: Failed to add MainTask to watchdog");
   }
+#endif
 
   for (;;) {
     handleNetworkCommunication();  // Network: Web server and WebSocket handling
