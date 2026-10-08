@@ -35,7 +35,7 @@ const float RNOMINAL = 100.0;  // PT100 nominal resistance at 0°C
 const double ADC_MAX_VOLTAGE = 3.3;
 const int ADC_RESOLUTION = 4096;  // 12-bit ADC
 
-// --- Cross-cutting safety constants (read by both sensors.cpp and control_task.cpp) ---
+// --- Cross-cutting safety constants (read by both sensors.cpp and pid_control.cpp) ---
 const double safetyTemp = 225.0;   // °F, emergency cutoff
 const double minTemp = 32.0;       // °F, minimum valid reading (0°C)
 const double MAX_TEMP_RATE = 5.0;  // °F/s, unified rate-of-change safety limit
@@ -52,6 +52,7 @@ const unsigned long STARTUP_FILL_TIMEOUT = 120000;  // ms, one-time never-filled
 
 const unsigned long LOOP_TIMEOUT = 5000;  // ms, hardware watchdog timeout
 const unsigned long PID_JITTER_THRESHOLD = 105;  // ms, alert if PID cycle exceeds this
+const unsigned long FLOW_CALCULATION_INTERVAL = 500;  // ms, flow rate update interval
 
 // --- EEPROM Storage Structure ---
 const uint16_t EEPROM_SIGNATURE = 0xABCD;

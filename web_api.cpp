@@ -2,7 +2,7 @@
 // verbatim with one addition: handleRoot() now sends a Cache-Control header
 // on the static page assets (D1 from the architecture review) — the content
 // itself is unchanged PROGMEM data, so this only affects re-fetch behavior,
-// not what's served. Core 0 only.
+// not what's served. Single task only.
 //
 // The six web-asset headers (~700KB of PROGMEM HTML/CSS/JS) are included
 // ONLY here, not in the main .ino — each is a `const char[]` with internal
@@ -36,7 +36,7 @@ void recomputeSetupComplete();
 void startCleaningCycle();
 void stopCleaningCycle();
 
-// --- Shot/brew parameters (Core 0 only, shared with eeprom_store.cpp/state_machine.cpp) ---
+// --- Shot/brew parameters (shared with eeprom_store.cpp/state_machine.cpp) ---
 extern double originalSetpointTemp;
 extern double shotTargetTime;
 extern double shotTargetWeight;
@@ -65,6 +65,7 @@ extern double currentPressure;
 extern double currentFlowRate;
 extern double currentShotRatio;
 extern bool cleaningActive;
+extern SystemState currentState;
 
 // --- Performance counters (not static — see their declaration in the main .ino) ---
 extern unsigned long webRequestCount;
@@ -240,6 +241,10 @@ void handleCalibrateTempComplete() {
     tempCalComplete = true;
     recomputeSetupComplete();
     eepromDirty = true;
+    // This is now the only way to clear a critical RTD fault — a human has
+    // just confirmed the probe gives a sane reading, rather than it silently
+    // self-clearing the instant one good reading comes back (see sensors.cpp).
+    clearError(ERR_FLAG_RTD);
 
     char response[128];
     snprintf(response, sizeof(response),

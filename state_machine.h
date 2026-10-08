@@ -1,9 +1,10 @@
-// state_machine.h — the SystemState enum and the stateMux-protected
-// accessors, shared by both control_task.cpp (reads getState() to gate PID
-// boost behavior) and the main sketch (owns the full state machine). Full
-// transition logic stays in the main .ino for this pass; only the type and
-// accessor declarations are centralized here so both sides compile against
-// the same definition.
+// state_machine.h — the SystemState enum and its accessors, shared by both
+// pid_control.cpp (reads getState() to gate PID boost behavior) and the
+// main sketch (owns the full state machine). Full transition logic stays in
+// the main .ino for this pass; only the type and accessor declarations are
+// centralized here so both sides compile against the same definition.
+// getState()/changeState() are plain reads/writes now — single task, no
+// mutex needed.
 #pragma once
 
 enum SystemState {

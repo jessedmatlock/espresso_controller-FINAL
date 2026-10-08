@@ -1,5 +1,5 @@
 // display.cpp — OLED partial-update rendering. Extracted verbatim; no logic
-// changes. Core 0 only.
+// changes. Single task only.
 #include <Arduino.h>
 #include <U8g2lib.h>
 #include "error_system.h"
@@ -9,7 +9,7 @@
 // Hardware object — defined in the main .ino.
 extern U8G2_SH1107_128X128_F_HW_I2C u8g2;
 
-// --- Shared Core 0 state this display reads ---
+// --- Shared state this display reads ---
 extern bool displayFailed;
 extern bool setupComplete;
 extern double shotTime;

@@ -1,5 +1,5 @@
 // web_api.h — HTTP handlers, WebSocket, and the unified JSON status builder.
-// Core 0 only.
+// Single task only.
 #pragma once
 #include <Arduino.h>
 #include <WebSocketsServer.h>

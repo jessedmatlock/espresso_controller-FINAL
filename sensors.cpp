@@ -31,7 +31,6 @@ extern bool scaleInitialized;
 extern float scaleCalibrationFactor;
 extern int32_t scaleZeroOffset;
 extern double shotWeight;
-extern portMUX_TYPE scaleMux;
 extern bool brewActive;
 extern bool scaleReliableEntireShot;
 extern double doseWeight;
@@ -51,10 +50,9 @@ extern double currentPressure;
 extern double pressureOffset;
 extern double pressureScale;
 extern bool pressureLockoutActive;
-extern volatile SystemState currentState;
+extern SystemState currentState;
 
 // --- RTD-internal state: only read_boiler_temp()/initRTDSensor() touch these ---
-static bool rtdFault = false;
 static double lastTemp = 77.0;
 static unsigned long lastTempTime = 0;
 
@@ -76,13 +74,11 @@ double fahrenheitToCelsius(double fahrenheit) {
 bool initRTDSensor() {
   if (!rtdSensor.begin(MAX31865_3WIRE)) {
     Serial.println("MAX31865 RTD sensor initialization failed");
-    rtdFault = true;
     setError(ERR_FLAG_RTD);
     return false;
   }
 
   Serial.println("MAX31865 RTD sensor initialized (3-wire PT100)");
-  rtdFault = false;
 
   // Auto-confirm temperature probe on successful initialization
   // PT100 is a precision sensor - if hardware detects no faults and reading is valid,
@@ -152,7 +148,6 @@ double read_boiler_temp() {
     }
 
     rtdSensor.clearFault();  // Clear the fault register
-    rtdFault = true;
     setError(ERR_FLAG_RTD);
 
     // Return last known good temperature
@@ -171,7 +166,6 @@ double read_boiler_temp() {
   // Validate temperature reading
   if (tempCelsius < -50.0 || tempCelsius > 200.0) {
     Serial.printf("Invalid temperature reading: %.2f°C\n", tempCelsius);
-    rtdFault = true;
     setError(ERR_FLAG_RTD);
     setTemp(lastValidTemp);
     return lastValidTemp;
@@ -180,12 +174,15 @@ double read_boiler_temp() {
   // Convert to Fahrenheit
   double tempFahrenheit = celsiusToFahrenheit(tempCelsius);
 
-  // Clear RTD fault if reading is valid
-  if (rtdFault && hasErrorFlag(ERR_FLAG_RTD)) {
-    rtdFault = false;
-    clearError(ERR_FLAG_RTD);
-    Serial.printf("RTD fault cleared. Temperature: %.1f°F\n", tempFahrenheit);
-  }
+  // RTD faults no longer auto-clear here. A sensor fault means the last
+  // several readings weren't trustworthy, and auto-resuming control the
+  // instant one good reading comes back is exactly how a loose/intermittent
+  // RTD connection would cause heating to flicker on and off automatically —
+  // undermining the "manual reboot required" intent requiresManualReboot()
+  // already applies to this flag. Clearing ERR_FLAG_RTD now requires the
+  // explicit /calibrate/temp/complete action (handleCalibrateTempComplete()),
+  // the same path tempCalComplete already goes through, instead of happening
+  // as a silent side effect of this read.
 
   // Temperature rate-of-change safety check
   if (lastTempTime > 0) {
@@ -268,9 +265,7 @@ void readScale() {
 
       // During brew, allow weight increases (normal progression)
       if (brewActive && reading > lastValidScaleWeight) {
-        portENTER_CRITICAL(&scaleMux);
         shotWeight = reading;  // Accept increasing weight during brew
-        portEXIT_CRITICAL(&scaleMux);
         lastValidScaleWeight = reading;
         scaleStableReadings = 0;  // Reset stability counter
         scaleConnected = true;
@@ -279,9 +274,7 @@ void readScale() {
         // Stability check for non-brew or decreasing weight
         scaleStableReadings++;
         if (scaleStableReadings >= requiredStableReadings) {
-          portENTER_CRITICAL(&scaleMux);
           shotWeight = reading;  // Accept stable reading
-          portEXIT_CRITICAL(&scaleMux);
           scaleConnected = true;
           clearError(ERR_FLAG_SCALE);
         }
@@ -314,9 +307,7 @@ void readScale() {
 void tareScale() {
   if (scaleInitialized && nau.available()) {
     scaleZeroOffset = nau.read();
-    portENTER_CRITICAL(&scaleMux);
     shotWeight = 0.0;
-    portEXIT_CRITICAL(&scaleMux);
     Serial.println("Scale tared");
   }
 }

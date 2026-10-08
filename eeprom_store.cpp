@@ -1,5 +1,5 @@
 // eeprom_store.cpp — load/save/init for all EEPROM-persisted parameters.
-// Extracted verbatim; no logic changes. Core 0 only.
+// Extracted verbatim; no logic changes. Single task only.
 #include <Arduino.h>
 #include <EEPROM.h>
 #include "config.h"
@@ -11,7 +11,7 @@
 // Helper defined in the main .ino.
 void recomputeSetupComplete();
 
-// --- Shot/brew parameters (Core 0 only, shared with web_api.cpp/state_machine.cpp) ---
+// --- Shot/brew parameters (shared with web_api.cpp/state_machine.cpp) ---
 extern double originalSetpointTemp;
 extern double shotTargetTime;
 extern double shotTargetWeight;
@@ -34,6 +34,7 @@ extern bool tempCalComplete;
 extern bool pressureCalComplete;
 extern bool boilerFilled;
 extern bool scaleCalComplete;
+extern SystemState currentState;
 
 void writeFloatToEEPROM(int address, float value) {
   byte* p = (byte*)(void*)&value;
@@ -75,7 +76,7 @@ void saveParametersToEEPROM() {
     return;
   }
 
-  // Re-entrancy guard (all callers are on Core 0, no spinlock needed)
+  // Re-entrancy guard (single task, no spinlock needed)
   static volatile bool eepromSaveInProgress = false;
   if (eepromSaveInProgress) {
     Serial.println("EEPROM save already in progress - skipping");

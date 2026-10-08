@@ -1,5 +1,5 @@
 // eeprom_store.h — EEPROM persistence for all configurable parameters.
-// Core 0 only.
+// Single task only.
 #pragma once
 
 void initEEPROM();

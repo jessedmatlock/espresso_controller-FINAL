@@ -9,7 +9,7 @@
 #include "shared_state.h"
 #include "relays.h"
 
-// brewActive/fillActive: Core 0 only, owned by state_machine (main .ino).
+// brewActive/fillActive: owned by state_machine (main .ino).
 // pressureLockoutActive/currentPressure: owned by sensors (main .ino for now).
 extern bool brewActive;
 extern bool fillActive;

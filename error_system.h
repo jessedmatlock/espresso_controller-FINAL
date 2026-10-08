@@ -16,9 +16,9 @@
 
 extern std::atomic<uint8_t> errorFlags;
 
-// System message for display (OLED bottom line / web UI banner). Owned by
-// Core 0 only. updateSystemMessage() derives the error-related text; other
-// Core 0 files (state_machine.cpp, web_api.cpp) assign non-error status text
+// System message for display (OLED bottom line / web UI banner). Single
+// task only. updateSystemMessage() derives the error-related text; other
+// files (state_machine.cpp, web_api.cpp) assign non-error status text
 // directly, exactly as in the original design.
 extern String systemMessage;
 
@@ -47,9 +47,12 @@ bool isDisplayOnlyError();
 bool requiresManualReboot();
 void emergencyStop();
 
-// Consolidated error set/clear — only call from Core 0 (main/system task).
-// The PID task (Core 1) must use setErrorFlag()/clearErrorFlag() directly,
-// since emergencyStop()/Serial access are Core-0-only, exactly as before.
+// Consolidated error set/clear — does Serial logging and, for critical
+// flags, calls emergencyStop(). pid_control.cpp's hot path (pid_step(),
+// called every 100ms) deliberately uses setErrorFlag()/clearErrorFlag()
+// directly instead, to avoid that Serial/emergencyStop overhead on every
+// cycle — not because of a core boundary (there isn't one), but to keep
+// the PID control path fast and defer logging to processPIDTaskLogs().
 void setError(uint8_t flag);
 void clearError(uint8_t flag);
 void updateSystemMessage();

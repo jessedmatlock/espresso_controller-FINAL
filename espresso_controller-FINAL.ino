@@ -105,10 +105,14 @@ Features:
  - Boiler temperature read via MAX31865 (PT100 3-wire RTD)
  - OLED Display (1.5" 128x128 SH1107 Driver, IIC 4 Pins) with partial updates
  - NAU7802 24-bit ADC Load Cell (I2C interface) for shot weight measurement
- - Explicit dual-core architecture: ControlTask (Core 1, FreeRTOS task, 100ms
-   vTaskDelayUntil-paced) for PID control; SystemTask (Core 0, FreeRTOS task,
-   explicitly pinned) for web UI, display, sensors, and state machine. Both
-   tasks are created explicitly in setup() — neither core is assumed.
+ - Single-task architecture: one explicitly-pinned FreeRTOS task (MainTask)
+   runs PID control, web UI, display, sensors, and the state machine in a
+   single sequential loop. PID control (updatePidControl()) is self-gated
+   to 100ms using the same millisElapsed() pattern as every other periodic
+   subsystem — no cross-task shared state, no mutexes. (An earlier revision
+   split this across two tasks on two cores; collapsed back to one after an
+   architecture review found the split didn't deliver the isolation it
+   assumed — see project notes.)
  - Comprehensive state machine with error handling and safety margins
  - Real-time Web UI with Chart.js shot graphing
  - Complete EEPROM parameter storage including PID gains and fill probe threshold
@@ -147,7 +151,7 @@ NOTE: Fully requirements-compliant production firmware per specification documen
 #include "error_system.h"
 #include "shared_state.h"
 #include "state_machine.h"
-#include "control_task.h"
+#include "pid_control.h"
 #include "relays.h"
 #include "sensors.h"
 #include "calibration.h"
@@ -184,9 +188,14 @@ const char* password = "espresso";
 WebServer server(80);
 WebSocketsServer webSocket = WebSocketsServer(81);
 
-// Core 0 SystemTask handle — declared here (used by setup() below, defined
-// alongside systemTask() near loop() at the bottom of the file).
-static TaskHandle_t systemTaskHandle = NULL;
+// The single task running everything (PID control included) — declared here
+// (used by setup() below, defined alongside mainTask() near loop() at the
+// bottom of the file). One task, one core: there used to be a second task
+// (the old "ControlTask") pinned to Core 1 for PID; it's been folded into
+// this one (see pid_control.h) since the actual PID computation is a few
+// microseconds of work every 100ms and never justified a dedicated core —
+// see the architecture analysis this session for why.
+static TaskHandle_t mainTaskHandle = NULL;
 
 // Web server rate limiting
 unsigned long lastWebRequest = 0;
@@ -199,9 +208,11 @@ const unsigned long WEBSOCKET_BROADCAST_INTERVAL = 100;  // 100ms WebSocket upda
 // EEPROM signature, size, and ADDR_* memory map now live in config.h.
 
 // --- State Machine ---
-// SystemState enum now lives in state_machine.h (shared with control_task.cpp).
-volatile SystemState currentState = STATE_BOOT;
-volatile SystemState previousState = STATE_BOOT;
+// SystemState enum now lives in state_machine.h (shared with pid_control.cpp).
+// No longer volatile — single task, no concurrent reader/writer to guard
+// visibility against.
+SystemState currentState = STATE_BOOT;
+SystemState previousState = STATE_BOOT;
 
 // First-run setup state
 bool setupComplete = false;        // True when required calibrations are done
@@ -228,7 +239,7 @@ unsigned long preInfusionStartTime = 0;
 
 // currentTemp and cachedRawTemp now live in shared_state.cpp
 // (getTemp()/setTemp(), getCachedRawTemp()/setCachedRawTemp()).
-// pidOutput is now a local variable inside control_task.cpp's pid_step().
+// pidOutput is now a local variable inside pid_control.cpp's pid_step().
 
 // Temperature rate-of-change protection (unified limit for sensor and PID)
 // MAX_TEMP_RATE now lives in config.h; lastTemp/lastTempTime are now private
@@ -252,7 +263,7 @@ bool fillActive = false;
 double currentFlowRate = 0.0;  // ml/s extraction rate
 double lastWeightForFlow = 0.0;
 unsigned long lastFlowCalculation = 0;
-const unsigned long FLOW_CALCULATION_INTERVAL = 500;  // 500ms flow rate update interval
+// FLOW_CALCULATION_INTERVAL now lives in config.h (sensors.cpp needs it too).
 double smoothedFlowRate = 0.0;                        // Smoothed flow rate for display
 bool flowRateFirstCalculation = true;                 // Reset flag for new brew cycles
 
@@ -285,13 +296,14 @@ bool pumpTimeoutTriggered = false;
 bool completionMessageActive = false;
 
 // --- Performance Monitoring Variables ---
-// PID timing validation (volatile: written by control_task.cpp's checkPIDTiming()
-// on Core 1, read by logPerformanceMetrics() on Core 0). NOT static — control_task.cpp
-// needs external linkage to these via `extern` to keep updating the same counters
-// it always has; PID_JITTER_THRESHOLD now lives in config.h for the same reason.
-volatile unsigned long lastPIDTime = 0;
-volatile unsigned long maxPIDJitter = 0;
-volatile unsigned long pidJitterCount = 0;
+// PID timing validation: written by pid_control.cpp's checkPIDTiming(), read
+// by logPerformanceMetrics() here. Not static, purely so pid_control.cpp can
+// `extern` them — a cross-file linkage need, not a synchronization one, so
+// no volatile either (single task, nothing reads these asynchronously).
+// PID_JITTER_THRESHOLD lives in config.h for the same linkage reason.
+unsigned long lastPIDTime = 0;
+unsigned long maxPIDJitter = 0;
+unsigned long pidJitterCount = 0;
 
 // Memory monitoring
 static unsigned long lastMemoryCheck = 0;
@@ -301,25 +313,24 @@ const unsigned long MEMORY_CHECK_INTERVAL = 5000;  // Check every 5 seconds
 
 // Performance metrics — not static: written from web_api.cpp's
 // handleStatus()/broadcastWebSocketData(), read by logPerformanceMetrics()
-// here (same cross-TU reason as the PID jitter counters above).
+// here (same cross-file-linkage reason as the PID jitter counters above).
 unsigned long webRequestCount = 0;
 unsigned long webSocketMessageCount = 0;
 unsigned long maxWebResponseTime = 0;
 unsigned long totalWebResponseTime = 0;
 
-// Load monitoring flags
-// Not static — control_task.cpp reads/writes these via `extern` (see note above).
-volatile bool performanceMonitoringEnabled = true;  // Read by Core 1, written by Core 0 (serial cmds)
+// Load monitoring flags — not static for the same cross-file-linkage reason.
+bool performanceMonitoringEnabled = true;  // Read/written from serial commands and pid_control.cpp
 static bool memoryWarningActive = false;
-volatile bool pidTimingWarningActive = false;  // Written by Core 1, read by Core 0
+bool pidTimingWarningActive = false;  // Written by pid_control.cpp, read here
 
-// PID task logging flags (set by PID task, processed by main loop)
-volatile bool pidLogTempRateError = false;
-volatile double pidLogTempRate = 0.0;
-volatile bool pidLogTimingWarning = false;
-volatile unsigned long pidLogJitter = 0;
-volatile unsigned long pidLogJitterCount = 0;
-volatile bool pidLogTimingNormalized = false;
+// PID logging flags (set by updatePidControl(), processed by processPIDTaskLogs())
+bool pidLogTempRateError = false;
+double pidLogTempRate = 0.0;
+bool pidLogTimingWarning = false;
+unsigned long pidLogJitter = 0;
+unsigned long pidLogJitterCount = 0;
+bool pidLogTimingNormalized = false;
 
 // Scale variables
 float scaleCalibrationFactor = 1.0;
@@ -336,8 +347,10 @@ const unsigned long CLEANING_MAX_DURATION = 300000;      // 5 minutes maximum cl
 const unsigned long PUMP_RESPONSE_TIMEOUT = 15000;       // 15 seconds pump response timeout
 const int PUMP_FAILURE_COUNT = 3;                        // Consecutive failures before stop
 
-// Scale data protection mutex
-portMUX_TYPE scaleMux = portMUX_INITIALIZER_UNLOCKED;
+// scaleMux removed — every reader/writer of shotWeight/scale calibration
+// readings is on the single task; it was never actually guarding against a
+// second task even before today's change (confirmed in the architecture
+// review this session).
 
 // CalStep enum, calStep global, and isCalibrating()/isPressureCal()/
 // isFillScaleCal() now live in calibration.h (shared broadly).
@@ -398,18 +411,20 @@ const unsigned long PRESSURE_READ_INTERVAL = 250;  // 250ms pressure reading
 // readPressure() — nothing else referenced them.
 
 // ADC_MAX_VOLTAGE/ADC_RESOLUTION now live in config.h.
-// pid_integral/pid_prev_error/pidMux/pidTaskHandle/pidTaskRunning now live
-// in control_task.cpp (private to the ControlTask).
+// pid_integral/pid_prev_error now live in pid_control.cpp as plain statics —
+// no task handle, no mutex; there's only one task, so nothing can touch
+// them concurrently.
 
 // EEPROM save re-entrancy guard is a static bool inside saveParametersToEEPROM()
-// Deferred EEPROM save — reduces flash wear by coalescing rapid parameter changes
-volatile bool eepromDirty = false;
+// Deferred EEPROM save — reduces flash wear by coalescing rapid parameter changes.
+// Not volatile — single task; this also fixes a latent mismatch where
+// calibration.cpp/web_api.cpp's `extern bool eepromDirty` declarations never
+// had the qualifier this definition did.
+bool eepromDirty = false;
 
-// State change mutex - protects currentState from race conditions
-portMUX_TYPE stateMux = portMUX_INITIALIZER_UNLOCKED;
-
-// controlMux, tempMux, and cachedTempMux now live inside shared_state.cpp
-// as inputsMux/outputsMux/cachedTempMux (private to that file).
+// stateMux removed — single task, changeState()/getState() no longer need
+// a critical section. controlMux/tempMux/cachedTempMux were already folded
+// into shared_state.cpp and have likewise had their locks removed there.
 
 // FreeRTOS variables removed - using simple millis() timing per requirements
 
@@ -424,7 +439,8 @@ unsigned long lastLoopTime = 0;
 unsigned long lastWatchdogCheck = 0;
 // LOOP_TIMEOUT now lives in config.h.
 const unsigned long LOOP_CHECK_INTERVAL = 1000;  // Check every second
-bool loopTimeoutTriggered = false;
+// loopTimeoutTriggered removed — it gated two recovery branches for
+// ERR_FLAG_LOOP_TIMEOUT, which nothing ever set (see handleSystemErrors()).
 // rtdFault is now private to sensors.cpp (initRTDSensor()/read_boiler_temp()).
 
 // Initialization failure tracking
@@ -487,19 +503,15 @@ void stopBrewRoutine();
 void startFillRoutine();
 void stopCleaningCycle();
 
-// PID control now declared in control_task.h (pid_step() is private to
-// control_task.cpp; only initPIDTask()/resetPidIntegral() are public).
+// PID control now declared in pid_control.h (pid_step() is private to
+// pid_control.cpp; only updatePidControl()/resetPidIntegral() are public).
 
-// Core 0 steady-state task (explicitly pinned in setup(); see its definition
-// near loop() for why Arduino's own loop() is now an inert stub).
-void systemTask(void* parameter);
+// The single task running everything, explicitly pinned in setup(); see its
+// definition near loop() for why Arduino's own loop() is now an inert stub.
+void mainTask(void* parameter);
 
 // Sensors now declared in sensors.h.
-uint8_t getErrorFlags();
-
-// Error system
-void setError(uint8_t flag);
-void clearError(uint8_t flag);
+// Error system (setError/clearError/getErrorFlags/etc.) declared in error_system.h.
 
 // Hardware init (initRelays() now declared in relays.h; runStartupFillCycle()
 // removed — see updateFillRoutine()/setup() for the non-blocking replacement)
@@ -556,11 +568,8 @@ bool isPidAllowed() {
 
 // --- Error Management Functions ---
 void emergencyStop() {
-  // Stop heating and pumping systems for critical errors (per requirements)
-  // Use critical sections to ensure atomic state changes - avoid nested mutexes
-  
-  // First: Stop all hardware outputs and state variables (stateMux protected)
-  portENTER_CRITICAL(&stateMux);
+  // Stop heating and pumping systems for critical errors (per requirements).
+  // No critical section needed — single task, nothing can interleave here.
   set_pump(false);
   set_brew_solenoid(false);
   set_fill_solenoid(false);
@@ -568,9 +577,8 @@ void emergencyStop() {
   brewActive = false;
   fillActive = false;
   fillInProgress = false;
-  portEXIT_CRITICAL(&stateMux);
-  
-  // Second: Stop control variables (each setter takes its own lock, avoid nesting)
+
+  // Stop control variables
   setPidBoostActive(false);
   setPreInfusionActive(false);
   setPreInfusionPhase(false);
@@ -585,63 +593,12 @@ void emergencyStop() {
   }
 }
 
-// Helper function to update system message based on current error flags
-void updateSystemMessage() {
-  uint8_t flags = getErrorFlags();
-  if (flags == 0) {
-    systemMessage = "";
-    return;
-  }
-  if (flags & ERR_FLAG_TEMP) systemMessage = "TEMP ERR";
-  else if (flags & ERR_FLAG_RTD) systemMessage = "TEMP ERR";
-  else if (flags & ERR_FLAG_PID) systemMessage = "PID ERR";
-  else if (flags & ERR_FLAG_PRESSURE) systemMessage = "PRESS ERR";
-  else if (flags & ERR_FLAG_SCALE) systemMessage = "SCALE ERR";
-  else if (flags & ERR_FLAG_LOOP_TIMEOUT) systemMessage = "LOOP ERR";
-  else if (flags & ERR_FLAG_DISPLAY) systemMessage = "DISP ERR";
-  else if (flags & ERR_FLAG_I2C) systemMessage = "I2C ERR";
-}
-
-// Consolidated error set — atomically sets flag, derives message, triggers actions
-// Only call from Core 0 (main loop). PID task (Core 1) must use setErrorFlag() directly.
-void setError(uint8_t flag) {
-  setErrorFlag(flag);
-  updateSystemMessage();
-  if (isCriticalError()) {
-    emergencyStop();
-    Serial.printf("Critical error active: %s - emergency stop activated\n", systemMessage.c_str());
-  } else if (isDisplayOnlyError()) {
-    Serial.printf("Display-only error: %s - system continues operation\n", systemMessage.c_str());
-  } else if (isRecoverableError()) {
-    Serial.printf("Recoverable error: %s - auto-recovery enabled\n", systemMessage.c_str());
-  }
-}
-
-// Consolidated error clear — atomically clears flag, re-derives message
-// Only call from Core 0 (main loop).
-void clearError(uint8_t flag) {
-  clearErrorFlag(flag);
-  updateSystemMessage();
-}
-
-bool hasError() {
-  return getErrorFlags() != 0;
-}
-
-bool isRecoverableError() {
-  uint8_t flags = getErrorFlags();
-  return (flags & (ERR_FLAG_SCALE | ERR_FLAG_LOOP_TIMEOUT | ERR_FLAG_DISPLAY | ERR_FLAG_I2C | ERR_FLAG_PRESSURE)) != 0;
-}
-
-bool isCriticalError() {
-  uint8_t flags = getErrorFlags();
-  return (flags & (ERR_FLAG_TEMP | ERR_FLAG_RTD | ERR_FLAG_PID)) != 0;
-}
-
-bool isDisplayOnlyError() {
-  uint8_t flags = getErrorFlags();
-  return (flags == ERR_FLAG_SCALE);  // Only scale error, no other errors
-}
+// updateSystemMessage()/setError()/clearError()/hasError()/isRecoverableError()/
+// isCriticalError()/isDisplayOnlyError() live in error_system.cpp (declared
+// in error_system.h, already included above). This block used to duplicate
+// those definitions here too — a leftover from the file-decomposition pass
+// that would have failed to link (multiple definition of 7 symbols) on any
+// actual build attempt. Removed as part of this reliability pass.
 
 bool requiresManualReboot() {
   // During initial commissioning (setupComplete=false), demote all errors to
@@ -758,17 +715,13 @@ void handleSystemErrors() {
   // Handle pressure errors (managed by pressure reading function with hysteresis)
   // Pressure recovery is handled automatically in readPressure() function
 
-  // Handle loop timeout errors (auto-recovery)
-  if (loopTimeoutTriggered && hasErrorFlag(ERR_FLAG_LOOP_TIMEOUT)) {
-    static unsigned long loopTimeoutStartTime = 0;
-    if (loopTimeoutStartTime == 0) loopTimeoutStartTime = millis();
-    unsigned long now = millis();
-    if ((now - loopTimeoutStartTime) > 5000) {  // 5 second recovery time
-      loopTimeoutTriggered = false;
-      loopTimeoutStartTime = 0;
-      clearError(ERR_FLAG_LOOP_TIMEOUT);
-    }
-  }
+  // ERR_FLAG_LOOP_TIMEOUT's recovery handling used to live here. Removed:
+  // nothing in this codebase ever sets that flag (confirmed by grep — it was
+  // vestigial from an earlier software-watchdog design), so this branch
+  // could never execute. The hardware watchdog (esp_task_wdt) is what
+  // actually catches a stalled loop, and it hard-resets rather than
+  // recovering gracefully — this dead branch implied a capability that
+  // didn't exist.
 
   // Check PID error conditions
   checkPIDError();
@@ -870,28 +823,27 @@ void checkBrewSwitch() {
 // --- Brew Routine Functions ---
 // --- State Machine Functions ---
 void changeState(SystemState newState) {
-  portENTER_CRITICAL(&stateMux);
   if (currentState != newState) {
     previousState = currentState;
     currentState = newState;
-    portEXIT_CRITICAL(&stateMux);
     Serial.printf("State change: %d -> %d\n", previousState, currentState);
-    // Flush pending EEPROM writes on transition to IDLE (catch changes before power-off)
-    if (newState == STATE_IDLE && eepromDirty) {
-      saveParametersToEEPROM();
-      eepromDirty = false;
-    }
-  } else {
-    portEXIT_CRITICAL(&stateMux);
+    // Deliberately no EEPROM flush here. This used to synchronously call
+    // saveParametersToEEPROM() on every transition into STATE_IDLE with
+    // dirty parameters — an EEPROM.commit() can take tens of milliseconds
+    // on this platform, and calling it from inside the state-machine
+    // transition function blocked the entire control loop for that long on
+    // every brew-to-idle transition. That's exactly the hazard the
+    // deferred-EEPROM design (eepromDirty + the 2-second periodic flush in
+    // handleSystemMonitoring()) exists to avoid; this eager path bypassed
+    // it. The periodic flush already catches the same dirty parameters
+    // within 2 seconds, without blocking a state transition to do it.
   }
 }
 
-// Thread-safe state getter for use from ISRs or other tasks
+// Single-task now — this is just a named accessor for currentState (kept so
+// every existing call site stays unchanged), not a synchronization point.
 SystemState getState() {
-  portENTER_CRITICAL(&stateMux);
-  SystemState state = currentState;
-  portEXIT_CRITICAL(&stateMux);
-  return state;
+  return currentState;
 }
 
 // getTemp/setTemp and getCachedRawTemp/setCachedRawTemp now live in shared_state.cpp.
@@ -928,13 +880,16 @@ void updateStateMachine() {
     case STATE_IDLE:
       // Check for critical error conditions - stop heating/pumping but maintain operation
       if (isCriticalError()) {
-        emergencyStop();  // Stop heating/pumping systems
-        // DO NOT change state - maintain IDLE operation for non-critical functions
+        emergencyStop();  // Stop heating/pumping systems; may itself transition to
+                           // STATE_ERROR if this fault requires manual reboot (RTD/PID)
         break;
       }
 
-      // Check for fill needed (only if no errors)
-      if (!hasError() && !fillProbeWet && !fillInProgress) {
+      // Check for fill needed (only if no errors, and not mid pressure calibration —
+      // checkFillLevel() won't actually start the fill hardware during calibration,
+      // so flipping the state label here without that guard left the system stuck
+      // in STATE_FILL with no way back to IDLE once calibration finished).
+      if (!hasError() && !fillProbeWet && !fillInProgress && !isPressureCal()) {
         changeState(STATE_FILL);
         break;
       }
@@ -943,6 +898,14 @@ void updateStateMachine() {
       break;
 
     case STATE_BREW_START:
+      // Re-check for a critical error here (not just at the button press that
+      // requested this state) — closes the gap between checkBrewSwitch()'s check
+      // and this state actually being processed.
+      if (isCriticalError()) {
+        Serial.println("Critical error detected before brew start - aborting");
+        changeState(STATE_IDLE);
+        break;
+      }
       // Start brew routine
       startBrewRoutine();
       changeState(STATE_BREW_ACTIVE);
@@ -954,8 +917,13 @@ void updateStateMachine() {
       // 1. Critical error during brew - stop heating/pumping but maintain operation
       if (isCriticalError()) {
         Serial.printf("Critical error during brew: %s - stopping heating/pumping\n", systemMessage.c_str());
-        emergencyStop();              // Stop heating/pumping systems
-        changeState(STATE_BREW_END);  // End brew but maintain system operation
+        emergencyStop();  // Stop heating/pumping systems; transitions to STATE_ERROR
+                           // itself if this fault requires manual reboot (RTD/PID) —
+                           // only fall through to BREW_END for faults that don't, so
+                           // that transition doesn't immediately overwrite ERROR.
+        if (!requiresManualReboot()) {
+          changeState(STATE_BREW_END);  // End brew but maintain system operation
+        }
         break;
       }
 
@@ -1009,6 +977,23 @@ void updateStateMachine() {
       break;
 
     case STATE_CLEANING:
+      // Critical error - abort cleaning immediately, matching every other active
+      // state. Without this, a TEMP fault (which deliberately doesn't change
+      // currentState, to allow hysteresis auto-recovery) left this cycling logic
+      // running unaware, free to turn the pump back on moments after
+      // emergencyStop() turned it off — fighting pid_control.cpp's own
+      // independent TEMP-triggered pump cutoff.
+      if (isCriticalError()) {
+        Serial.printf("Critical error during cleaning: %s - stopping cleaning\n", systemMessage.c_str());
+        stopCleaningCycle();
+        emergencyStop();  // Stops pump/solenoids again (idempotent) and transitions
+                           // to STATE_ERROR itself if this fault requires manual reboot.
+        if (!requiresManualReboot()) {
+          changeState(STATE_IDLE);
+        }
+        break;
+      }
+
       // Cleaning cycle active - pump cycling logic
       if (cleaningActive) {
         // Check maximum cleaning duration safety limit
@@ -1018,9 +1003,6 @@ void updateStateMachine() {
           changeState(STATE_IDLE);
           break;
         }
-
-
-        unsigned long currentTime = millis();
 
         if (cleaningPumpState) {
           // Pump and brew solenoid are ON - check timeout and normal duration
@@ -1089,10 +1071,6 @@ void updateStateMachine() {
           clearError(ERR_FLAG_SCALE);
           changeState(STATE_IDLE);
           Serial.println("SCALE error auto-recovered");
-        } else if (hasErrorFlag(ERR_FLAG_LOOP_TIMEOUT) && !loopTimeoutTriggered) {
-          clearError(ERR_FLAG_LOOP_TIMEOUT);
-          changeState(STATE_IDLE);
-          Serial.println("LOOP_TIMEOUT error auto-recovered");
         }
       }
 
@@ -1375,8 +1353,8 @@ void updateFillRoutine() {
   }
 }
 
-// pidTask()/checkPIDTiming()/pid_step()/initPIDTask() now live in
-// control_task.cpp (the Core 1 ControlTask).
+// checkPIDTiming()/pid_step()/updatePidControl() now live in pid_control.cpp,
+// called directly from MainTask's loop — no separate task.
 
 // --- Performance Monitoring Functions (memory/web metrics stay on Core 0) ---
 void checkMemoryUsage() {
@@ -1417,7 +1395,7 @@ void logPerformanceMetrics() {
 
   Serial.println("=== PERFORMANCE METRICS ===");
   Serial.printf("PID Timing: Max jitter %lums, Warning count: %lu\n", maxPIDJitter, pidJitterCount);
-  Serial.printf("Memory: Current %u bytes, Minimum %u bytes\n", ESP.getFreeHeap(), minFreeHeap);
+  Serial.printf("Memory: Current %lu bytes, Minimum %lu bytes\n", (unsigned long)ESP.getFreeHeap(), (unsigned long)minFreeHeap);
   Serial.printf("Web Requests: Total %lu, Avg response: %lums\n",
                 webRequestCount,
                 webRequestCount > 0 ? totalWebResponseTime / webRequestCount : 0);
@@ -1428,17 +1406,13 @@ void logPerformanceMetrics() {
   Serial.println("==========================");
 }
 
-// pid_step() and initPIDTask() now live in control_task.cpp.
-
 // writeFloatToEEPROM()/readFloatFromEEPROM()/writeUint16ToEEPROM()/
 // readUint16FromEEPROM()/saveParametersToEEPROM()/loadParametersFromEEPROM()/
 // initEEPROM() now live in eeprom_store.cpp.
 
 // All web server handlers, webSocketEvent(), buildStatusJSON(),
 // sendWebSocketData(), and broadcastWebSocketData() now live in
-// web_api.cpp. The stale "hardware timer ISR" comment that used to sit
-// here (contradicted by control_task.cpp's actual FreeRTOS-task
-// implementation) has been removed.
+// web_api.cpp.
 // --- Setup & Loop ---
 void setup() {
   Serial.begin(115200);
@@ -1450,7 +1424,12 @@ void setup() {
   initRelays();
   Serial.println("Relay outputs initialized (all OFF)");
 
-  // Initialize hardware watchdog
+  // Initialize the hardware watchdog subsystem (global init only — the task
+  // that actually registers itself with esp_task_wdt_add() is mainTask(),
+  // once it starts running at the end of setup(); registering here would
+  // register whichever task is executing setup(), not the task that goes on
+  // to call esp_task_wdt_reset(), which is exactly the mismatch that used to
+  // leave the watchdog unfed).
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
   esp_task_wdt_config_t wdt_config = {
     .timeout_ms = LOOP_TIMEOUT,
@@ -1461,7 +1440,6 @@ void setup() {
 #else
   esp_task_wdt_init(LOOP_TIMEOUT / 1000, true);
 #endif
-  esp_task_wdt_add(NULL);
 
   // Initialize I2C and OLED Display
   if (!Wire.begin()) {
@@ -1486,7 +1464,7 @@ void setup() {
   // Non-blocking startup fill: rather than running a dedicated blocking loop
   // here (which used to hold up WiFi/web server startup for up to 2 minutes
   // on every boot where the steam boiler was dry), let the normal FILL state
-  // machine handle it once SystemTask starts — same behavior, just not
+  // machine handle it once MainTask starts — same behavior, just not
   // blocking. If the probe is already wet there's nothing to fill, so mark
   // boilerFilled directly (matching the old "already filled" branch).
   if (fillProbeWet) {
@@ -1514,8 +1492,8 @@ void setup() {
   // Initialize MAX31865 RTD sensor
   initRTDSensor();
 
-  // Initialize Core 1 PID Task (dedicated FreeRTOS task for deterministic control)
-  initPIDTask();
+  // PID control no longer has its own task to initialize — it's
+  // updatePidControl(), called from mainTask()'s loop (see below).
 #else
   // --- BENCH MODE: Skip hardware, heater blocked in set_boiler_element() ---
   Serial.println("========================================");
@@ -1567,33 +1545,42 @@ void setup() {
   lastFillCheck = millis();
   systemStartTime = millis();
 
-  // Explicitly pin the steady-state workload to Core 0 instead of relying on
-  // wherever the Arduino framework's own setup()/loop() task happens to run —
-  // see SystemTask below. Arduino's loop() becomes an inert stub after this.
-  BaseType_t sysTaskResult = xTaskCreatePinnedToCore(
-    systemTask,        // Task function
-    "SystemTask",      // Task name
-    8192,              // Stack size (bytes) — web server + display + sensors
+  // Explicitly pin the entire steady-state workload — PID control included —
+  // to one named task on one core, instead of relying on wherever the
+  // Arduino framework's own setup()/loop() task happens to run. Pinned to
+  // Core 1 specifically to keep it away from the internal WiFi/BT tasks
+  // ESP-IDF typically runs on Core 0, not because anything here needs
+  // isolation from another *application* task — there isn't a second one
+  // anymore. Arduino's loop() becomes an inert stub after this.
+  BaseType_t mainTaskResult = xTaskCreatePinnedToCore(
+    mainTask,          // Task function
+    "MainTask",        // Task name
+    8192,              // Stack size (bytes) — web server + display + sensors + PID
     NULL,              // Parameters
-    1,                 // Priority (low — ControlTask's priority 24 always preempts)
-    &systemTaskHandle,  // Task handle
-    0                  // Core 0 — explicit, never assumed
+    1,                 // Priority — nothing else at the application level to preempt
+    &mainTaskHandle,   // Task handle
+    1                  // Core 1 — explicit, never assumed
   );
-  if (sysTaskResult != pdPASS) {
-    Serial.println("ERROR: Failed to create SystemTask on Core 0");
+  if (mainTaskResult != pdPASS) {
+    Serial.println("ERROR: Failed to create MainTask");
   }
 
   // --- REQUIREMENTS-COMPLIANT SETUP COMPLETE ---
   Serial.println("System ready:");
-  Serial.println("- Core 1: ControlTask for PID control (100ms)");
-  Serial.println("- Core 0: SystemTask with millis() timing for non-critical operations");
+  Serial.println("- MainTask: PID control, web UI, display, sensors, state machine");
+  Serial.println("  (single task, single core — see architecture analysis for why)");
 }
 
 // --- Core Loop Functions ---
 void handlePIDUpdates() {
-  // PID control runs independently on Core 1 via dedicated FreeRTOS task
-  // Main loop responsibility: Read temperature via SPI and cache for PID task
-  // This keeps SPI access on Core 0 for better bus arbitration
+  // Refreshes the cached raw temperature that updatePidControl() consumes.
+  // Kept as a separate 50ms-cadence cache (rather than having PID read the
+  // RTD directly every 100ms) specifically so PID's EMA filter keeps seeing
+  // the same input cadence it always has — changing that would change the
+  // filter's effective time constant and PID's control behavior. This was
+  // originally about keeping SPI access off a separate PID core; now that
+  // there's one task, the cadence-preservation reason is the one that
+  // still matters.
 
   static unsigned long lastTempCache = 0;
   unsigned long now = millis();
@@ -1881,21 +1868,38 @@ void handleSerialCommands() {
   }
 }
 
-// --- Core 0 SystemTask ---
+// --- MainTask: the only task running the steady-state workload ---
 // Explicitly pinned (see setup()) instead of relying on the Arduino
 // framework's default placement for its own loop() task. Everything here
-// was previously the body of loop() — same functions, same order, same
-// millis()-based timing; only the task that runs it is now explicit.
-// (systemTaskHandle is declared near the top of the file, alongside the
-// other task handles, since setup() references it before this point.)
-void systemTask(void* parameter) {
-  Serial.printf("SystemTask started on core %d\n", xPortGetCoreID());
+// was previously split across two tasks (a "SystemTask" doing this same
+// sequence, and a separate "ControlTask" running updatePidControl()'s logic
+// independently at 100ms on its own core) — folded into one task, one core,
+// since PID's actual per-cycle work is microseconds and never justified a
+// dedicated core; see the architecture analysis this session for the full
+// reasoning. updatePidControl() is internally gated to 100ms (same
+// self-gating pattern as handlePIDUpdates()/handleSensorReadings() below),
+// so calling it unconditionally here every iteration is correct.
+// (mainTaskHandle is declared near the top of the file, alongside the other
+// globals, since setup() references it before this point.)
+void mainTask(void* parameter) {
+  Serial.printf("MainTask started on core %d\n", xPortGetCoreID());
+
+  // Register THIS task with the watchdog — must happen here, not in
+  // setup(), because esp_task_wdt_reset() below only feeds the watchdog
+  // entry for whichever task calls it. Registering from setup() would
+  // register the Arduino main/loop task instead, which never calls reset()
+  // again once it falls into the inert loop() below — leaving the real
+  // watchdog entry unfed and causing a panic/reboot every LOOP_TIMEOUT.
+  if (esp_task_wdt_add(NULL) != ESP_OK) {
+    Serial.println("WARNING: Failed to add MainTask to watchdog");
+  }
 
   for (;;) {
     handleNetworkCommunication();  // Network: Web server and WebSocket handling
 #ifndef BENCH_MODE
-    handlePIDUpdates();            // Critical: temperature reading + caching for ControlTask
-    handleSystemMonitoring();      // Safety: Error monitoring and watchdog
+    handlePIDUpdates();            // Critical: temperature reading + caching for PID
+    updatePidControl();            // Critical: PID control (self-gated to 100ms)
+    handleSystemMonitoring();      // Safety: Error monitoring and watchdog feed
     updateStateMachine();          // Control: State machine updates
     handleSensorReadings();        // Sensors: Scale and pressure readings
     handleUserInterface();         // Display: OLED updates
@@ -1911,7 +1915,7 @@ void systemTask(void* parameter) {
 }
 
 // Arduino's own setup()/loop() task is no longer where the steady-state
-// workload runs (see systemTask above) — loop() is intentionally inert.
+// workload runs (see mainTask above) — loop() is intentionally inert.
 void loop() {
   vTaskDelay(portMAX_DELAY);
 }

@@ -1,56 +1,51 @@
-// control_task.cpp — Core 1 PID control task. See control_task.h for the
-// core-ownership contract. Extracted from the original pidTask()/pid_step()/
-// initPIDTask() with identical logic; the only behavioral change is that
-// Kp/Ki/Kd and boilerHeating now flow through shared_state.h's mutex-
-// protected accessors instead of bare globals (see shared_state.cpp).
+// pid_control.cpp — PID temperature control. Same math as the original
+// pid_step()/checkPIDTiming(), unchanged — the only thing removed is the
+// FreeRTOS task wrapper (pidTask()/initPIDTask()) and the pidMux critical
+// sections, both of which existed solely to make this safe to call from a
+// second CPU core. With a single task running everything, there is no
+// concurrent caller to guard against: pid_integral/pid_prev_error are now
+// plain statics, exactly as safe as the `static double lastPidTemp` already
+// sitting a few lines below them always was.
 #include <Arduino.h>
-#include <esp_task_wdt.h>
 #include "config.h"
 #include "error_system.h"
 #include "shared_state.h"
 #include "state_machine.h"
-#include "control_task.h"
+#include "pid_control.h"
 
-// --- Functions defined elsewhere, called from this task ---
-// isPidAllowed(): main .ino (depends on setupComplete, Core-0-owned).
-// set_boiler_element()/set_pump(): relays.cpp.
-// millisElapsed(): main .ino (pure helper, no shared state).
-bool isPidAllowed();
-void set_boiler_element(bool state);
-void set_pump(bool state);
-bool millisElapsed(unsigned long startTime, unsigned long interval);
+// --- Functions defined elsewhere ---
+bool isPidAllowed();                                       // main .ino
+void set_boiler_element(bool state);                        // relays.cpp
+void set_pump(bool state);                                   // relays.cpp
+bool millisElapsed(unsigned long startTime, unsigned long interval);  // main .ino
 
-// --- Performance-monitoring variables: still owned by the main .ino
-// (shared with checkMemoryUsage()/logPerformanceMetrics()/processPIDTaskLogs()
-// on Core 0, and the PERF_* serial commands) — unchanged, not part of this
-// refactor's scope. Declared extern here since checkPIDTiming()/pid_step()
-// read and write them from Core 1, exactly as before.
-extern volatile unsigned long lastPIDTime;
-extern volatile unsigned long maxPIDJitter;
-extern volatile unsigned long pidJitterCount;
-extern volatile bool performanceMonitoringEnabled;
-extern volatile bool pidTimingWarningActive;
-extern volatile bool pidLogTempRateError;
-extern volatile double pidLogTempRate;
-extern volatile bool pidLogTimingWarning;
-extern volatile unsigned long pidLogJitter;
-extern volatile unsigned long pidLogJitterCount;
-extern volatile bool pidLogTimingNormalized;
+// --- Performance-monitoring variables: owned by the main .ino, shared with
+// checkMemoryUsage()/logPerformanceMetrics()/processPIDTaskLogs() and the
+// PERF_* serial commands. Still declared extern (not merged into this file)
+// since they're genuinely about the whole system's performance, not just
+// PID — unrelated to the single-task change.
+extern unsigned long lastPIDTime;
+extern unsigned long maxPIDJitter;
+extern unsigned long pidJitterCount;
+extern bool performanceMonitoringEnabled;
+extern bool pidTimingWarningActive;
+extern bool pidLogTempRateError;
+extern double pidLogTempRate;
+extern bool pidLogTimingWarning;
+extern unsigned long pidLogJitter;
+extern unsigned long pidLogJitterCount;
+extern bool pidLogTimingNormalized;
 
-// --- Core 1 task internals — private to this file ---
-static TaskHandle_t pidTaskHandle = NULL;
-static volatile bool pidTaskRunning = false;
-static portMUX_TYPE pidMux = portMUX_INITIALIZER_UNLOCKED;
-static volatile double pid_integral = 0.0;
-static volatile double pid_prev_error = 0.0;
+// Private to this file. No longer volatile or mutex-guarded — single task,
+// no concurrent access is possible.
+static double pid_integral = 0.0;
+static double pid_prev_error = 0.0;
 
 void resetPidIntegral() {
-  portENTER_CRITICAL(&pidMux);
   pid_integral = 0.0;
-  portEXIT_CRITICAL(&pidMux);
 }
 
-// --- Performance Monitoring (PID timing only; memory/web metrics stay on Core 0) ---
+// --- Performance Monitoring (PID cycle timing) ---
 static void checkPIDTiming() {
   if (!performanceMonitoringEnabled) return;
 
@@ -83,13 +78,12 @@ static void checkPIDTiming() {
   lastPIDTime = currentTime;
 }
 
-// --- PID Control Function (runs every 100ms on the ControlTask) ---
+// --- PID Control Function (called once per CONTROL_INTERVAL_MS) ---
 static void pid_step() {
   // Performance monitoring - PID timing check
   checkPIDTiming();
 
   // Safety override FIRST - stop heating/pumping for critical errors before any computation
-  // Use atomic error flags for thread-safe access from Core 1
   if (hasCriticalErrorFlag()) {
     setCurrentPIDOutputPercent(0.0);
     set_boiler_element(false);
@@ -101,7 +95,10 @@ static void pid_step() {
     return;
   }
 
-  // Use cached raw temperature from main loop (avoids SPI access from Core 1)
+  // Use the cached raw temperature (refreshed every ~50ms elsewhere) rather
+  // than reading the RTD directly here — unchanged from the original design.
+  // This keeps the EMA filter below fed at the same cadence it always was;
+  // changing that cadence would change the filter's effective behavior.
   double temp = getCachedRawTemp();
 
   // Temperature rate-of-change safety check (uses unified MAX_TEMP_RATE constant)
@@ -114,7 +111,7 @@ static void pid_step() {
     if (timeDiff > 0) {
       double tempRate = abs(temp - lastPidTemp) / timeDiff;
       if (tempRate > MAX_TEMP_RATE) {
-        // Set flag for main loop to log (avoid Serial from this task)
+        // Set flag for main loop to log (keeps Serial access off the hot path)
         pidLogTempRate = tempRate;
         pidLogTempRateError = true;
         setErrorFlag(ERR_FLAG_TEMP);
@@ -139,7 +136,7 @@ static void pid_step() {
     filteredTemp = TEMP_FILTER_ALPHA * temp + (1.0 - TEMP_FILTER_ALPHA) * filteredTemp;
   }
 
-  // Publish filtered temp for Core 0 (display/JSON) via shared_state
+  // Publish filtered temp for display/JSON/web
   setTemp(filteredTemp);
 
   // PID Boost override during brew (100% heater for configurable duration)
@@ -153,15 +150,10 @@ static void pid_step() {
   }
 
   double error = getSetpointTemp() - filteredTemp;
-
-  // Snapshot gains before the pidMux critical section — avoids nesting the
-  // inputsMux (inside getKp/getKi/getKd) inside pidMux.
   double snapKp = getKp();
   double snapKi = getKi();
   double snapKd = getKd();
 
-  double pidOutput;
-  portENTER_CRITICAL(&pidMux);
   pid_integral += error * (CONTROL_INTERVAL_MS / 1000.0);
 
   // PID integral windup protection
@@ -172,10 +164,9 @@ static void pid_step() {
   // Negative sign because we're measuring temperature change, not error change
   // Uses prevPidTemp (stored before update) to get actual temperature rate of change
   double derivative = -(filteredTemp - prevPidTemp) / (CONTROL_INTERVAL_MS / 1000.0);
-  pidOutput = snapKp * error + snapKi * pid_integral + snapKd * derivative;
+  double pidOutput = snapKp * error + snapKi * pid_integral + snapKd * derivative;
   // Note: pid_prev_error kept for potential future use, but derivative now uses measurement
   pid_prev_error = error;
-  portEXIT_CRITICAL(&pidMux);
 
   // Map pidOutput to 0..1 via clamp and scaling
   // PID_OUTPUT_SCALE of 1000.0 means:
@@ -206,62 +197,19 @@ static void pid_step() {
   else set_boiler_element(false);
 }
 
-// --- Core 1 ControlTask ---
-static void pidTask(void* parameter) {
-  TickType_t xLastWakeTime = xTaskGetTickCount();
-  const TickType_t xFrequency = pdMS_TO_TICKS(CONTROL_INTERVAL_MS);  // 100ms
+void updatePidControl() {
+  static unsigned long lastPidRun = 0;
+  if (!millisElapsed(lastPidRun, CONTROL_INTERVAL_MS)) return;
+  lastPidRun = millis();
 
-  pidTaskRunning = true;
-  Serial.printf("ControlTask started on core %d\n", xPortGetCoreID());
-  // Register this task with the watchdog to catch stalls
-  if (esp_task_wdt_add(NULL) != ESP_OK) {
-    Serial.println("WARNING: Failed to add ControlTask to watchdog");
-  }
-
-  for (;;) {
-    // Wait for next cycle (precise timing with vTaskDelayUntil)
-    vTaskDelayUntil(&xLastWakeTime, xFrequency);
-    // Feed watchdog for this task
-    esp_task_wdt_reset();
-
-    // Check if required calibrations are complete before running PID
-    if (!isPidAllowed()) {
-      // Setup not complete - disable PID heating, only read temperature
-      set_boiler_element(false);
-      setCurrentPIDOutputPercent(0.0);
-
-      // Reset PID integral to prevent windup accumulation during setup
-      resetPidIntegral();
-
-      // Use cached temp for display (main loop handles SPI reads)
-      setTemp(getCachedRawTemp());
-      continue;
-    }
-
-    // Execute PID control (publishes filteredTemp/pidOutputPercent/boilerHeating
-    // via shared_state.h for Core 0 to read)
-    pid_step();
-  }
-}
-
-void initPIDTask() {
-  // Create dedicated PID task on Core 1 with highest priority
-  // Priority 24 is highest for application tasks (configMAX_PRIORITIES - 1)
-  // Stack size 6144 bytes provides margin for PID calculations and safety checks
-  BaseType_t result = xTaskCreatePinnedToCore(
-    pidTask,         // Task function
-    "ControlTask",   // Task name
-    6144,            // Stack size (bytes) - increased for safety margin
-    NULL,            // Parameters
-    24,              // Priority (highest for real-time control)
-    &pidTaskHandle,  // Task handle
-    1                // Core 1 (dedicated to PID) — explicit, never assumed
-  );
-
-  if (result != pdPASS) {
-    Serial.println("ERROR: Failed to create ControlTask on Core 1");
+  if (!isPidAllowed()) {
+    // Setup not complete - disable PID heating, only read temperature
+    set_boiler_element(false);
+    setCurrentPIDOutputPercent(0.0);
+    resetPidIntegral();
+    setTemp(getCachedRawTemp());
     return;
   }
 
-  Serial.println("ControlTask created on Core 1 (100ms interval, highest priority)");
+  pid_step();
 }

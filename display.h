@@ -1,4 +1,4 @@
-// display.h — OLED (SH1107, partial-update) rendering. Core 0 only.
+// display.h — OLED (SH1107, partial-update) rendering. Single task only.
 #pragma once
 
 void initDisplay();

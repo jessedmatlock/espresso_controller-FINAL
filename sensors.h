@@ -1,6 +1,6 @@
-// sensors.h — all sensor bus I/O (SPI/I2C/ADC), Core 0 only. control_task.cpp
-// (Core 1) never calls into this file directly; it only ever reads the
-// cached/filtered values these functions publish via shared_state.h.
+// sensors.h — all sensor bus I/O (SPI/I2C/ADC). pid_control.cpp never calls
+// into this file directly; it only ever reads the cached/filtered values
+// these functions publish via shared_state.h.
 #pragma once
 
 // RTD (MAX31865 PT100, SPI)

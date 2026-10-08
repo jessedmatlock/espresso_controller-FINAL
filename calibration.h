@@ -1,6 +1,7 @@
-// calibration.h — fill/scale/pressure calibration state machine. Core 0
-// only; shared broadly (state machine, web handlers) since isPressureCal()/
-// isFillScaleCal() gate brew/fill behavior outside calibration.cpp itself.
+// calibration.h — fill/scale/pressure calibration state machine. Single
+// task only; shared broadly (state machine, web handlers) since
+// isPressureCal()/isFillScaleCal() gate brew/fill behavior outside
+// calibration.cpp itself.
 #pragma once
 #include <Arduino.h>
 

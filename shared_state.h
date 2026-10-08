@@ -1,21 +1,14 @@
-// shared_state.h — the ONLY place cross-core (Core 0 <-> Core 1 / ControlTask)
-// data is allowed to live. Every field here is reachable from both
-// systemTask (Core 0) and controlTask (Core 1); every access goes through one
-// of the functions below, never through a bare global.
-//
-// ControlInputs: written by Core 0 (web handlers, serial commands, EEPROM
-//   load, brew routine), read by Core 1 (pid_step()).
-// ControlOutputs: written by Core 1 (pid_step()), read by Core 0 (display,
-//   JSON status, web API).
-// cachedRawTemp: written by Core 0 (handlePIDUpdates(), ~50ms SPI read cache),
-//   read by Core 1 (pid_step()) — unchanged from the original design, just
-//   colocated here since it's also a cross-core primitive.
-//
-// Nothing outside this .h/.cpp pair should declare a portMUX_TYPE for
-// PID-related state. If a new PID-adjacent value needs to cross cores, it
-// belongs in one of the two structs below, with its own getter/setter added
-// to this file — that is the enforcement mechanism for keeping this boundary
-// closed.
+// shared_state.h — central storage for PID-related parameters and results
+// (setpoint, gains, boost/pre-infusion flags, filtered temp, PID output
+// percent, boiler-heating state, cached raw temp). Everything here is
+// reachable from multiple files (pid_control.cpp, web_api.cpp,
+// eeprom_store.cpp, calibration.cpp, display.cpp) which is why it's
+// centralized behind named accessors rather than scattered bare globals —
+// that's an encapsulation choice, not a synchronization one. This firmware
+// runs as a single FreeRTOS task, so there is no concurrent access to guard
+// against; an earlier revision had these accessors take a mutex each,
+// because Kp/Ki/Kd and boilerHeating used to cross a Core 0/Core 1 task
+// boundary. That boundary no longer exists (see pid_control.h).
 #pragma once
 #include <Arduino.h>
 
@@ -33,10 +26,10 @@ struct ControlInputs {
 struct ControlOutputs {
   double filteredTemp = 77.0;       // replaces the old bare `currentTemp`
   double pidOutputPercent = 0.0;    // replaces the old bare `currentPIDOutputPercent`
-  bool boilerHeating = false;       // was unprotected before this refactor
+  bool boilerHeating = false;
 };
 
-// --- ControlInputs accessors (Core 0 writes, Core 1 reads) ---
+// --- ControlInputs accessors ---
 double getSetpointTemp();
 void setSetpointTemp(double temp);
 void addSetpointTemp(double delta);
@@ -58,7 +51,7 @@ void setPreInfusionActive(bool active);
 bool getAllowUnsafePid();
 void setAllowUnsafePid(bool allowed);
 
-// --- ControlOutputs accessors (Core 1 writes, Core 0 reads) ---
+// --- ControlOutputs accessors ---
 double getTemp();
 void setTemp(double temp);
 
@@ -68,7 +61,11 @@ void setCurrentPIDOutputPercent(double percent);
 bool getBoilerHeatingState();
 void setBoilerHeatingState(bool on);
 
-// --- Cached raw temperature (Core 0 writes @ ~50ms, Core 1 reads) ---
-// Unchanged from the original design — relocated here only for colocation.
+// --- Cached raw temperature ---
+// Refreshed every ~50ms by handlePIDUpdates(), consumed every ~100ms by
+// updatePidControl(). Kept as its own named pair (not folded into
+// ControlInputs) because it has its own producer/cadence — see the comment
+// on handlePIDUpdates() for why this indirection is kept even though PID
+// could now call the RTD read directly.
 double getCachedRawTemp();
 void setCachedRawTemp(double temp);

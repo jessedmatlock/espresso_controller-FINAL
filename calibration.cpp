@@ -1,5 +1,5 @@
 // calibration.cpp — fill probe, scale, and pressure calibration flows.
-// Extracted verbatim; no logic changes. Core 0 only.
+// Extracted verbatim; no logic changes. Single task only.
 #include <Arduino.h>
 #include <Adafruit_NAU7802.h>
 #include "config.h"
@@ -29,7 +29,6 @@ extern int32_t scaleZeroOffset;
 extern int32_t scaleZeroReading;
 extern int32_t scaleKnownWeightReading;
 extern bool scaleCalComplete;
-extern portMUX_TYPE scaleMux;
 
 // --- Pressure calibration state ---
 extern bool pressureCalComplete;
@@ -42,6 +41,7 @@ extern double pressureScale;
 // --- Setup-flow flags ---
 extern bool setupComplete;
 extern bool eepromDirty;
+extern SystemState currentState;
 
 const char* calStepName(CalStep s) {
   switch (s) {
@@ -103,9 +103,7 @@ void processCalibrationStep() {
 
     case CAL_SCALE_ZERO:
       if (scaleInitialized && nau.available()) {
-        portENTER_CRITICAL(&scaleMux);
         scaleZeroReading = nau.read();
-        portEXIT_CRITICAL(&scaleMux);
         Serial.printf("Scale ZERO reading: %.2f\n", (float)scaleZeroReading);
         calStep = CAL_SCALE_WEIGHT;
         Serial.println("Now place known weight (100g or 200g) on scale");
@@ -114,9 +112,7 @@ void processCalibrationStep() {
 
     case CAL_SCALE_WEIGHT:
       if (scaleInitialized && nau.available()) {
-        portENTER_CRITICAL(&scaleMux);
         scaleKnownWeightReading = nau.read();
-        portEXIT_CRITICAL(&scaleMux);
         Serial.printf("Scale WEIGHT reading: %.2f\n", (float)scaleKnownWeightReading);
         calStep = CAL_SCALE_CONFIRM;
         Serial.println("Enter known weight value to complete calibration");
